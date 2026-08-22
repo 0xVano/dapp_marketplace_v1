@@ -8,14 +8,15 @@ import {ReentrancyGuard} from "./utils/ReentrancyGuard.sol";
 import {ECDSA} from "./utils/ECDSA.sol";
 
 /// @title Marketplace
-/// @notice MVP эскроу-маркетплейс: OfferRegistry + Purchase/Escrow + пул модераторов.
-/// @dev Полный Kleros-арбитраж сознательно не входит в MVP (см. Roadmap этап 1–2).
+/// @notice MVP эскроу-маркетплейс: OfferRegistry + Purchase/Escrow + пул модераторов
+/// @dev Полный Kleros-арбитраж не входит в MVP
 contract Marketplace is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint16 public constant FEE_BPS_MIN = 10; // 0.1%
     uint16 public constant FEE_BPS_MAX = 2000; // 20%
-    uint8 public constant MAX_MODERATORS = 5;
+    // изменить на нужный фиксированный процент с возможностью дальнейшего изменения
+    uint8 public constant MAX_MODERATORS = 5; //только в mvp
 
     bytes32 public constant OFFER_TYPEHASH = keccak256(
         "Offer(address seller,address token,uint256 amount,uint32 timelock,uint16 feeBps,uint64 expiresAt,bytes32 contentHash,string ipfsCid,uint256 nonce)"
@@ -43,35 +44,35 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address token;
         uint256 amount;
         uint32 timelock;
-        uint16 feeBps;
+        uint16 feeBps; //в теории убрать
         uint64 expiresAt;
-        bytes32 contentHash;
+        bytes32 contentHash; //зачем?
         string ipfsCid;
         bool active;
-        bool purchased;
+        bool purchased; //что если предложение можно покупать несколько раз?
     }
 
     struct Purchase {
         uint256 offerId;
         address buyer;
-        address seller;
-        address token;
+        address seller; //достать из Offer? Как и 4 строки ниже
+        address token; 
         uint256 amount;
         uint256 fee;
         uint256 sellerPayout;
-        uint64 deadline;
-        uint64 verdictDelayUntil;
+        uint64 deadline; //переименовать
+        uint64 verdictDelayUntil; //это что
         PurchaseState state;
         Receiver pendingReceiver;
         bytes32 evidenceHash;
         bool disputeLock;
     }
 
-    uint256 public nextOfferId = 1;
+    uint256 public nextOfferId = 1; //почему 1, а не +1?
     uint256 public nextPurchaseId = 1;
 
     address public feeRecipient;
-    uint16 public cancelFeeBps; // «комиссия сети» при отмене продавцом
+    uint16 public cancelFeeBps; // «комиссия сети» при отмене продавцом. Не знаю зачем, пусть сам комсу оплачивает, либо через релеер
     uint32 public verdictDelay; // после set_receiver таймер запускается заново (MVP без апелляций)
 
     mapping(uint256 => Offer) public offers;
