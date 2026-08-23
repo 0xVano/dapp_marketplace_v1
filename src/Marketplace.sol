@@ -9,13 +9,13 @@ import {ECDSA} from "./utils/ECDSA.sol";
 
 /// @title Marketplace
 /// @notice MVP эскроу-маркетплейс: OfferRegistry + Purchase/Escrow + пул модераторов
-/// @dev Полный Kleros-арбитраж не входит в MVP
+/// @dev Полный Kleros-подобный арбитраж не входит в MVP
 contract Marketplace is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint16 public constant FEE_BPS_MIN = 10; // 0.1%
     uint16 public constant FEE_BPS_MAX = 2000; // 20%
-    // изменить на нужный фиксированный процент с возможностью дальнейшего изменения
+    // продавец сам выставляет комисиию в этом диапазоне. Поменять как у cancelFeeBps
     uint8 public constant MAX_MODERATORS = 5; //только в mvp
 
     bytes32 public constant OFFER_TYPEHASH = keccak256(
@@ -31,6 +31,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
         Escrowed,
         Disputed,
         Settled
+        // есть несколько стадий escrow
+        // возможно добавить статус до подтверждения покупателем
     }
 
     enum Receiver {
@@ -44,31 +46,31 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address token;
         uint256 amount;
         uint32 timelock;
-        uint16 feeBps; //в теории убрать
-        uint64 expiresAt;
-        bytes32 contentHash; //зачем?
+        uint16 feeBps; //в теории убрать, потому что она одинаковая для всех. Хотя если делать категории может понадобиться.
+        uint64 expiresAt; // момент времени, после которого оффер больше нельзя купить. Если 0 — оффер бессрочный.
+        bytes32 contentHash; // CID доказывает неизменность файла, а этот хэш доказывает, что именно этот человек выставил этот оффер.
         string ipfsCid;
-        bool active;
+        bool active; // Выставляется на true при создании и переходит в false при отмене либо покупке. Не уверен, что это нужно
         bool purchased; //что если предложение можно покупать несколько раз?
     }
 
     struct Purchase {
         uint256 offerId;
-        address buyer;
+        address buyer; //нельзя менять на msg.sender потому что может быть релеер
         address seller; //достать из Offer? Как и 4 строки ниже
         address token; 
         uint256 amount;
         uint256 fee;
         uint256 sellerPayout;
-        uint64 deadline; //переименовать
-        uint64 verdictDelayUntil; //это что
+        uint64 autoRefundAt; //Это момент block.timestamp + offer.timelock, после истечения которого можно вернуть деньги покупателю
+        uint64 verdictDelayUntil; // Задержка перед выплатой после вынесения вердикта. Будет использоваться только если нужна апелляция
         PurchaseState state;
         Receiver pendingReceiver;
-        bytes32 evidenceHash;
+        bytes32 evidenceHash; //Хэш пакета доказательств (чат + файлы), который сторона предоставляет при открытии спора
         bool disputeLock;
     }
 
-    uint256 public nextOfferId = 1; //почему 1, а не +1?
+    uint256 public nextOfferId = 1;
     uint256 public nextPurchaseId = 1;
 
     address public feeRecipient;
@@ -78,18 +80,18 @@ contract Marketplace is Ownable, ReentrancyGuard {
     mapping(uint256 => Offer) public offers;
     mapping(uint256 => Purchase) public purchases;
     mapping(address => bool) public allowedTokens;
-    mapping(address => uint256) public nonces;
+    mapping(address => uint256) public nonces; //Защита от replay-атак для офчейн-подписей. Без nonce одну и ту же подпись можно было бы переиспользовать
 
     address[] public moderators;
     mapping(address => bool) public isModerator;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
-    mapping(uint256 => uint256) public votesForSeller;
+    mapping(uint256 => uint256) public votesForSeller; //работает для каждой сделки отдельно
     mapping(uint256 => uint256) public votesForBuyer;
 
     event TokenAllowed(address indexed token, bool allowed);
     event FeeRecipientUpdated(address indexed feeRecipient);
     event CancelFeeUpdated(uint16 cancelFeeBps);
-    event VerdictDelayUpdated(uint32 verdictDelay);
+    event VerdictDelayUpdated(uint32 verdictDelay); // в зависимости от типа дела может быть необходима разная задержка
     event ModeratorAdded(address indexed moderator);
     event ModeratorRemoved(address indexed moderator);
 
@@ -113,15 +115,15 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address seller,
         uint256 amount,
         uint256 fee,
-        uint64 deadline
+        uint64 autoRefundAt
     );
-    event ReceiptConfirmed(uint256 indexed purchaseId, address indexed buyer);
-    event SellerCancelled(uint256 indexed purchaseId, uint256 penalty, uint256 refund);
+    event ReceiptConfirmed(uint256 indexed purchaseId, address indexed buyer); //возможно переименовать
+    event SellerCancelled(uint256 indexed purchaseId, uint256 penalty, uint256 refund); //что это?
     event RefundedToBuyer(uint256 indexed purchaseId, uint256 amount);
     event DisputeOpened(uint256 indexed purchaseId, address indexed opener, bytes32 evidenceHash);
     event DisputeVote(uint256 indexed purchaseId, address indexed moderator, Receiver choice);
-    event ReceiverSet(uint256 indexed purchaseId, Receiver receiver, uint64 verdictDelayUntil);
-    event Settled(uint256 indexed purchaseId, address indexed receiver, uint256 amount, uint256 fee);
+    event ReceiverSet(uint256 indexed purchaseId, Receiver receiver, uint64 verdictDelayUntil); //переименовать
+    event Settled(uint256 indexed purchaseId, address indexed receiver, uint256 amount, uint256 fee); //переименовать
 
     error InvalidFee();
     error InvalidTimelock();
@@ -135,8 +137,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
     error NotParty();
     error NotModerator();
     error BadState();
-    error DeadlineNotReached();
-    error DeadlinePassed();
+    error autoRefundAtNotReached();
+    error autoRefundAtPassed();
     error AlreadyVoted();
     error DisputeLocked();
     error NoPendingReceiver();
@@ -145,12 +147,12 @@ contract Marketplace is Ownable, ReentrancyGuard {
     error NotAModerator();
     error TooManyModerators();
     error InvalidSignature();
-    error ZeroAddress();
+    error ZeroAddressError();
 
     constructor(address initialOwner, address feeRecipient_, uint16 cancelFeeBps_, uint32 verdictDelay_)
         Ownable(initialOwner)
     {
-        if (feeRecipient_ == address(0)) revert ZeroAddress();
+        if (feeRecipient_ == address(0)) revert ZeroAddressError();
         if (cancelFeeBps_ > FEE_BPS_MAX) revert InvalidFee();
         feeRecipient = feeRecipient_;
         cancelFeeBps = cancelFeeBps_;
@@ -165,13 +167,13 @@ contract Marketplace is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     function setAllowedToken(address token, bool allowed) external onlyOwner {
-        if (token == address(0)) revert ZeroAddress();
+        if (token == address(0)) revert ZeroAddressError();
         allowedTokens[token] = allowed;
         emit TokenAllowed(token, allowed);
     }
 
     function setFeeRecipient(address feeRecipient_) external onlyOwner {
-        if (feeRecipient_ == address(0)) revert ZeroAddress();
+        if (feeRecipient_ == address(0)) revert ZeroAddressError();
         feeRecipient = feeRecipient_;
         emit FeeRecipientUpdated(feeRecipient_);
     }
@@ -188,7 +190,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
     }
 
     function addModerator(address moderator) external onlyOwner {
-        if (moderator == address(0)) revert ZeroAddress();
+        if (moderator == address(0)) revert ZeroAddressError();
         if (isModerator[moderator]) revert ModeratorExists();
         if (moderators.length >= MAX_MODERATORS) revert TooManyModerators();
         isModerator[moderator] = true;
@@ -219,6 +221,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         return n == 0 ? 0 : n / 2 + 1;
     }
 
+    /// @notice Это защита от cross-contract/cross-chain replay, обязательная часть стандарта EIP-712
     function domainSeparator() public view returns (bytes32) {
         return keccak256(
             abi.encode(
@@ -334,7 +337,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
 
         uint256 fee = (offer.amount * offer.feeBps) / 10_000;
         uint256 sellerPayout = offer.amount - fee;
-        uint64 deadline = uint64(block.timestamp + offer.timelock);
+        uint64 autoRefundAt = uint64(block.timestamp + offer.timelock);
 
         purchaseId = nextPurchaseId++;
         purchases[purchaseId] = Purchase({
@@ -345,7 +348,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
             amount: offer.amount,
             fee: fee,
             sellerPayout: sellerPayout,
-            deadline: deadline,
+            autoRefundAt: autoRefundAt,
             verdictDelayUntil: 0,
             state: PurchaseState.Escrowed,
             pendingReceiver: Receiver.None,
@@ -354,7 +357,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         });
 
         IERC20(offer.token).safeTransferFrom(msg.sender, address(this), offer.amount);
-        emit PurchaseCreated(purchaseId, offerId, msg.sender, offer.seller, offer.amount, fee, deadline);
+        emit PurchaseCreated(purchaseId, offerId, msg.sender, offer.seller, offer.amount, fee, autoRefundAt);
     }
 
     function confirmReceipt(uint256 purchaseId) external nonReentrant {
@@ -378,7 +381,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         _paySeller(p, purchaseId);
     }
 
-    /// @notice Продавец отменяет заказ: покупателю возврат минус cancelFeeBps.
+    /// @notice Продавец отменяет заказ: покупателю возврат минус cancelFeeBps. // cancelFeeBps считаю ненужным.
     function sellerCancel(uint256 purchaseId) external nonReentrant {
         Purchase storage p = purchases[purchaseId];
         if (p.state != PurchaseState.Escrowed) revert BadState();
@@ -402,7 +405,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         Purchase storage p = purchases[purchaseId];
         if (p.state != PurchaseState.Escrowed) revert BadState();
         if (p.disputeLock) revert DisputeLocked();
-        if (block.timestamp < p.deadline) revert DeadlineNotReached();
+        if (block.timestamp < p.autoRefundAt) revert autoRefundAtNotReached();
 
         p.state = PurchaseState.Settled;
         IERC20(p.token).safeTransfer(p.buyer, p.amount);
