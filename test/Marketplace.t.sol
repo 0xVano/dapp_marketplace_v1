@@ -31,20 +31,24 @@ contract MarketplaceTest is Test {
         m.addModerator(mod2);
         m.addModerator(mod3);
 
-        usdc.mint(buyer, 1_000e6);
+        usdc.mint(buyer, 10_000e6);
         vm.prank(buyer);
         usdc.approve(address(m), type(uint256).max);
     }
 
     function _offer() internal returns (uint256 id) {
+        return _offerQty(1);
+    }
+
+    function _offerQty(uint256 quantity) internal returns (uint256 id) {
         vm.prank(seller);
-        id = m.createOffer(address(usdc), PRICE, 1 days, 500, 0, keccak256("meta"), "QmCid");
+        id = m.createOffer(address(usdc), PRICE, 1 days, 500, 0, keccak256("meta"), "QmCid", quantity);
     }
 
     function testHappyPath() public {
         uint256 offerId = _offer();
         vm.prank(buyer);
-        uint256 pid = m.purchase(offerId);
+        uint256 pid = m.purchase(offerId, 1);
 
         assertEq(usdc.balanceOf(address(m)), PRICE);
 
@@ -60,47 +64,88 @@ contract MarketplaceTest is Test {
     function testCannotPurchaseTwice() public {
         uint256 offerId = _offer();
         vm.prank(buyer);
-        m.purchase(offerId);
+        m.purchase(offerId, 1);
         vm.prank(buyer);
-        vm.expectRevert(Marketplace.OfferAlreadyPurchased.selector);
-        m.purchase(offerId);
+        vm.expectRevert(Marketplace.InsufficientQuantity.selector);
+        m.purchase(offerId, 1);
+    }
+
+    function testBatchPurchase() public {
+        uint256 offerId = _offerQty(5);
+        vm.prank(buyer);
+        uint256 pid = m.purchase(offerId, 3);
+
+        (,,,,, uint256 sold) = _offerSold(offerId);
+        assertEq(sold, 3);
+        (uint256 qty, uint256 amount) = _purchaseQtyAmount(pid);
+        assertEq(qty, 3);
+        assertEq(amount, PRICE * 3);
+        assertEq(usdc.balanceOf(address(m)), PRICE * 3);
+
+        vm.prank(buyer);
+        m.confirmReceipt(pid);
+        uint256 fee = (PRICE * 3 * 500) / 10_000;
+        assertEq(usdc.balanceOf(feeSink), fee);
+        assertEq(usdc.balanceOf(seller), PRICE * 3 - fee);
+    }
+
+    function testInfiniteQuantity() public {
+        uint256 offerId = _offerQty(0);
+        vm.prank(buyer);
+        m.purchase(offerId, 10);
+        vm.prank(buyer);
+        m.purchase(offerId, 1);
+        (,,,,, uint256 sold) = _offerSold(offerId);
+        assertEq(sold, 11);
+    }
+
+    function testCancelStopsFurtherSales() public {
+        uint256 offerId = _offerQty(10);
+        vm.prank(buyer);
+        m.purchase(offerId, 2);
+        vm.prank(seller);
+        m.cancelOffer(offerId);
+        vm.prank(buyer);
+        vm.expectRevert(Marketplace.OfferInactive.selector);
+        m.purchase(offerId, 1);
     }
 
     function testCannotPurchaseExpiredListing() public {
         vm.prank(seller);
-        uint256 offerId =
-            m.createOffer(address(usdc), PRICE, 1 days, 500, uint64(block.timestamp + 10), keccak256("m"), "cid");
+        uint256 offerId = m.createOffer(
+            address(usdc), PRICE, 1 days, 500, uint64(block.timestamp + 10), keccak256("m"), "cid", 1
+        );
         vm.warp(block.timestamp + 11);
         vm.prank(buyer);
         vm.expectRevert(Marketplace.OfferExpired.selector);
-        m.purchase(offerId);
+        m.purchase(offerId, 1);
     }
 
     function testRefundExpiredGoesToBuyer() public {
         uint256 offerId = _offer();
         vm.prank(buyer);
-        uint256 pid = m.purchase(offerId);
+        uint256 pid = m.purchase(offerId, 1);
         vm.warp(block.timestamp + 1 days);
         m.refundExpired(pid);
-        assertEq(usdc.balanceOf(buyer), 1_000e6);
+        assertEq(usdc.balanceOf(buyer), 10_000e6);
         assertEq(usdc.balanceOf(feeSink), 0);
     }
 
     function testSellerCancelTakesNetworkFee() public {
         uint256 offerId = _offer();
         vm.prank(buyer);
-        uint256 pid = m.purchase(offerId);
+        uint256 pid = m.purchase(offerId, 1);
         vm.prank(seller);
         m.sellerCancel(pid);
         uint256 penalty = (PRICE * 100) / 10_000;
         assertEq(usdc.balanceOf(feeSink), penalty);
-        assertEq(usdc.balanceOf(buyer), 1_000e6 - penalty);
+        assertEq(usdc.balanceOf(buyer), 10_000e6 - penalty);
     }
 
     function testSellerDisputeBlocksAutoRefund() public {
         uint256 offerId = _offer();
         vm.prank(buyer);
-        uint256 pid = m.purchase(offerId);
+        uint256 pid = m.purchase(offerId, 1);
         vm.prank(seller);
         m.openDispute(pid, keccak256("proof"));
         vm.warp(block.timestamp + 2 days);
@@ -111,7 +156,7 @@ contract MarketplaceTest is Test {
     function testModeratorMajorityPaysSeller() public {
         uint256 offerId = _offer();
         vm.prank(buyer);
-        uint256 pid = m.purchase(offerId);
+        uint256 pid = m.purchase(offerId, 1);
         vm.prank(buyer);
         m.openDispute(pid, keccak256("chat"));
 
@@ -129,7 +174,7 @@ contract MarketplaceTest is Test {
     function testModeratorMajorityRefundsBuyer() public {
         uint256 offerId = _offer();
         vm.prank(buyer);
-        uint256 pid = m.purchase(offerId);
+        uint256 pid = m.purchase(offerId, 1);
         vm.prank(seller);
         m.openDispute(pid, keccak256("undelivered"));
 
@@ -139,16 +184,16 @@ contract MarketplaceTest is Test {
         m.vote(pid, false);
 
         m.executeVerdict(pid);
-        assertEq(usdc.balanceOf(buyer), 1_000e6);
+        assertEq(usdc.balanceOf(buyer), 10_000e6);
     }
 
     function testFeeBounds() public {
         vm.prank(seller);
         vm.expectRevert(Marketplace.InvalidFee.selector);
-        m.createOffer(address(usdc), PRICE, 1 days, 9, 0, bytes32(0), "x");
+        m.createOffer(address(usdc), PRICE, 1 days, 9, 0, bytes32(0), "x", 1);
         vm.prank(seller);
         vm.expectRevert(Marketplace.InvalidFee.selector);
-        m.createOffer(address(usdc), PRICE, 1 days, 2001, 0, bytes32(0), "x");
+        m.createOffer(address(usdc), PRICE, 1 days, 2001, 0, bytes32(0), "x", 1);
     }
 
     function testCreateOfferWithSig() public {
@@ -164,6 +209,7 @@ contract MarketplaceTest is Test {
                 uint64(0),
                 keccak256("meta"),
                 keccak256(bytes("QmCid")),
+                uint256(7),
                 nonce
             )
         );
@@ -172,18 +218,43 @@ contract MarketplaceTest is Test {
         bytes memory sig = abi.encodePacked(r, s, v);
 
         uint256 id = m.createOfferWithSig(
-            seller, address(usdc), PRICE, 1 days, 500, 0, keccak256("meta"), "QmCid", sig
+            seller, address(usdc), PRICE, 1 days, 500, 0, keccak256("meta"), "QmCid", 7, sig
         );
-        (address sAddr,,,,,,,, bool active,) = _offerTuple(id);
+        (address sAddr,,,,,,,, bool active, uint256 quantity, uint256 sold) = _offerTuple(id);
         assertEq(sAddr, seller);
         assertTrue(active);
+        assertEq(quantity, 7);
+        assertEq(sold, 0);
     }
 
     function _offerTuple(uint256 id)
         internal
         view
-        returns (address, address, uint256, uint32, uint16, uint64, bytes32, string memory, bool, bool)
+        returns (
+            address,
+            address,
+            uint256,
+            uint32,
+            uint16,
+            uint64,
+            bytes32,
+            string memory,
+            bool,
+            uint256,
+            uint256
+        )
     {
         return m.offers(id);
+    }
+
+    function _offerSold(uint256 id) internal view returns (address, address, uint256, uint32, uint16, uint256) {
+        (address sAddr, address token, uint256 amount, uint32 timelock, uint16 feeBps,,,,, uint256 sold) =
+            m.offers(id);
+        return (sAddr, token, amount, timelock, feeBps, sold);
+    }
+
+    function _purchaseQtyAmount(uint256 id) internal view returns (uint256 qty, uint256 amount) {
+        (,,,, uint256 quantity, uint256 amt,,,,,,,,) = m.purchases(id);
+        return (quantity, amt);
     }
 }
