@@ -15,11 +15,11 @@ contract Marketplace is Ownable, ReentrancyGuard {
 
     uint16 public constant FEE_BPS_MIN = 10; // 0.1%
     uint16 public constant FEE_BPS_MAX = 2000; // 20%
-    // продавец сам выставляет комисиию в этом диапазоне. Поменять как у cancelFeeBps
+    // Сейчас продавец сам выставляет комисиию в этом диапазоне. Поменять как у cancelFeeBps
     uint8 public constant MAX_MODERATORS = 5; //только в mvp
 
     bytes32 public constant OFFER_TYPEHASH = keccak256(
-        "Offer(address seller,address token,uint256 amount,uint32 timelock,uint16 feeBps,uint64 expiresAt,bytes32 contentHash,string ipfsCid,uint256 nonce)"
+        "Offer(address seller,address token,uint256 amount,uint32 timelock,uint16 feeBps,uint64 expiresAt,bytes32 contentHash,string ipfsCid,uint256 quantity,uint256 nonce)"
     );
     bytes32 public constant CONFIRM_TYPEHASH = keccak256("Confirm(uint256 purchaseId,uint256 nonce)");
 
@@ -44,14 +44,15 @@ contract Marketplace is Ownable, ReentrancyGuard {
     struct Offer {
         address seller;
         address token;
-        uint256 amount;
+        uint256 amount; // цена за единицу товара, не общая сумма сделки
         uint32 timelock;
         uint16 feeBps; //в теории убрать, потому что она одинаковая для всех. Хотя если делать категории может понадобиться.
         uint64 expiresAt; // момент времени, после которого оффер больше нельзя купить. Если 0 — оффер бессрочный.
         bytes32 contentHash; // CID доказывает неизменность файла, а этот хэш доказывает, что именно этот человек выставил этот оффер.
         string ipfsCid;
-        bool active; // Выставляется на true при создании и переходит в false при отмене либо покупке. Не уверен, что это нужно
-        bool purchased; //что если предложение можно покупать несколько раз?
+        bool active; // true при создании; false только при cancelOffer (дальнейшие продажи стоп, непроданный остаток сгорает)
+        uint256 quantity; // объём лота: 0 = бесконечно. Не декрементируется при покупке — иначе 0 стало бы неотличимо от «бесконечно»
+        uint256 sold; // сколько единиц уже купили. remaining = quantity == 0 ? ∞ : quantity - sold
     }
 
     struct Purchase {
@@ -59,7 +60,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address buyer; //нельзя менять на msg.sender потому что может быть релеер
         address seller; //достать из Offer? Как и 4 строки ниже
         address token; 
-        uint256 amount;
+        uint256 quantity; // сколько единиц куплено в этой сделке (batch)
+        uint256 amount; // сумма эскроу = offer.amount (цена за единицу) * quantity
         uint256 fee;
         uint256 sellerPayout;
         uint64 autoRefundAt; //Это момент block.timestamp + offer.timelock, после истечения которого можно вернуть деньги покупателю
@@ -74,7 +76,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
     uint256 public nextPurchaseId = 1;
 
     address public feeRecipient;
-    uint16 public cancelFeeBps; // «комиссия сети» при отмене продавцом. Не знаю зачем, пусть сам комсу оплачивает, либо через релеер
     uint32 public verdictDelay; // после set_receiver таймер запускается заново (MVP без апелляций)
 
     mapping(uint256 => Offer) public offers;
@@ -90,7 +91,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
 
     event TokenAllowed(address indexed token, bool allowed);
     event FeeRecipientUpdated(address indexed feeRecipient);
-    event CancelFeeUpdated(uint16 cancelFeeBps);
     event VerdictDelayUpdated(uint32 verdictDelay); // в зависимости от типа дела может быть необходима разная задержка
     event ModeratorAdded(address indexed moderator);
     event ModeratorRemoved(address indexed moderator);
@@ -104,7 +104,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
         uint16 feeBps,
         uint64 expiresAt,
         bytes32 contentHash,
-        string ipfsCid
+        string ipfsCid,
+        uint256 quantity
     );
     event OfferCancelled(uint256 indexed offerId);
 
@@ -115,10 +116,11 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address seller,
         uint256 amount,
         uint256 fee,
-        uint64 autoRefundAt
+        uint64 autoRefundAt,
+        uint256 quantity
     );
     event ReceiptConfirmed(uint256 indexed purchaseId, address indexed buyer); //возможно переименовать
-    event SellerCancelled(uint256 indexed purchaseId, uint256 penalty, uint256 refund); //что это?
+	event SellerCancelled(uint256 indexed purchaseId, uint256 refund); // было (purchaseId, penalty, refund) Что это?
     event RefundedToBuyer(uint256 indexed purchaseId, uint256 amount);
     event DisputeOpened(uint256 indexed purchaseId, address indexed opener, bytes32 evidenceHash);
     event DisputeVote(uint256 indexed purchaseId, address indexed moderator, Receiver choice);
@@ -131,7 +133,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
     error TokenNotAllowed();
     error OfferInactive();
     error OfferExpired();
-    error OfferAlreadyPurchased();
+    error InvalidQuantity();
+    error InsufficientQuantity();
     error NotSeller();
     error NotBuyer();
     error NotParty();
@@ -149,16 +152,13 @@ contract Marketplace is Ownable, ReentrancyGuard {
     error InvalidSignature();
     error ZeroAddressError();
 
-    constructor(address initialOwner, address feeRecipient_, uint16 cancelFeeBps_, uint32 verdictDelay_)
+    constructor(address initialOwner, address feeRecipient_, uint32 verdictDelay_)
         Ownable(initialOwner)
     {
         if (feeRecipient_ == address(0)) revert ZeroAddressError();
-        if (cancelFeeBps_ > FEE_BPS_MAX) revert InvalidFee();
         feeRecipient = feeRecipient_;
-        cancelFeeBps = cancelFeeBps_;
         verdictDelay = verdictDelay_;
         emit FeeRecipientUpdated(feeRecipient_);
-        emit CancelFeeUpdated(cancelFeeBps_);
         emit VerdictDelayUpdated(verdictDelay_);
     }
 
@@ -176,12 +176,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
         if (feeRecipient_ == address(0)) revert ZeroAddressError();
         feeRecipient = feeRecipient_;
         emit FeeRecipientUpdated(feeRecipient_);
-    }
-
-    function setCancelFeeBps(uint16 cancelFeeBps_) external onlyOwner {
-        if (cancelFeeBps_ > FEE_BPS_MAX) revert InvalidFee();
-        cancelFeeBps = cancelFeeBps_;
-        emit CancelFeeUpdated(cancelFeeBps_);
     }
 
     function setVerdictDelay(uint32 verdictDelay_) external onlyOwner {
@@ -245,12 +239,14 @@ contract Marketplace is Ownable, ReentrancyGuard {
         uint16 feeBps,
         uint64 expiresAt,
         bytes32 contentHash,
-        string calldata ipfsCid
+        string calldata ipfsCid,
+        uint256 quantity
     ) external returns (uint256 offerId) {
-        return _createOffer(msg.sender, token, amount, timelock, feeBps, expiresAt, contentHash, ipfsCid);
+        return _createOffer(msg.sender, token, amount, timelock, feeBps, expiresAt, contentHash, ipfsCid, quantity);
     }
 
     /// @notice Relayer: продавец подписал офчейн, транзакцию шлёт любой адрес.
+    /// @dev `quantity` входит в EIP-712 `OFFER_TYPEHASH`; добавление поля меняет typehash-строку и инвалидирует старые подписи.
     function createOfferWithSig(
         address seller,
         address token,
@@ -260,6 +256,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         uint64 expiresAt,
         bytes32 contentHash,
         string calldata ipfsCid,
+        uint256 quantity,
         bytes calldata signature
     ) external returns (uint256 offerId) {
         uint256 nonce = nonces[seller]++;
@@ -274,17 +271,20 @@ contract Marketplace is Ownable, ReentrancyGuard {
                 expiresAt,
                 contentHash,
                 keccak256(bytes(ipfsCid)),
+                quantity,
                 nonce
             )
         );
         if (_recover(structHash, signature) != seller) revert InvalidSignature();
-        return _createOffer(seller, token, amount, timelock, feeBps, expiresAt, contentHash, ipfsCid);
+        return _createOffer(seller, token, amount, timelock, feeBps, expiresAt, contentHash, ipfsCid, quantity);
     }
 
+    /// @notice Останавливает дальнейшие продажи. Уже созданные Purchase не трогает (снимок seller/token/amount/quantity).
+    /// Непроданный остаток сгорает. Частичная отмена (оставить в продаже N штук) — отдельное расширение, не в MVP.
     function cancelOffer(uint256 offerId) external {
         Offer storage offer = offers[offerId];
         if (offer.seller != msg.sender) revert NotSeller();
-        if (!offer.active || offer.purchased) revert OfferInactive();
+        if (!offer.active) revert OfferInactive();
         offer.active = false;
         emit OfferCancelled(offerId);
     }
@@ -297,7 +297,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
         uint16 feeBps,
         uint64 expiresAt,
         bytes32 contentHash,
-        string calldata ipfsCid
+        string calldata ipfsCid,
+        uint256 quantity
     ) internal returns (uint256 offerId) {
         if (!allowedTokens[token]) revert TokenNotAllowed();
         if (amount == 0) revert InvalidAmount();
@@ -316,27 +317,30 @@ contract Marketplace is Ownable, ReentrancyGuard {
             contentHash: contentHash,
             ipfsCid: ipfsCid,
             active: true,
-            purchased: false
+            quantity: quantity,
+            sold: 0
         });
 
-        emit OfferCreated(offerId, seller, token, amount, timelock, feeBps, expiresAt, contentHash, ipfsCid);
+        emit OfferCreated(offerId, seller, token, amount, timelock, feeBps, expiresAt, contentHash, ipfsCid, quantity);
     }
 
     // -------------------------------------------------------------------------
     // Escrow / Purchase
     // -------------------------------------------------------------------------
 
-    function purchase(uint256 offerId) external nonReentrant returns (uint256 purchaseId) {
+    function purchase(uint256 offerId, uint256 quantity) external nonReentrant returns (uint256 purchaseId) {
+        if (quantity == 0) revert InvalidQuantity();
+
         Offer storage offer = offers[offerId];
-        if (offer.purchased) revert OfferAlreadyPurchased();
         if (!offer.active) revert OfferInactive();
         if (offer.expiresAt != 0 && block.timestamp > offer.expiresAt) revert OfferExpired();
+        if (offer.quantity != 0 && offer.sold + quantity > offer.quantity) revert InsufficientQuantity();
 
-        offer.active = false;
-        offer.purchased = true;
+        offer.sold += quantity;
 
-        uint256 fee = (offer.amount * offer.feeBps) / 10_000;
-        uint256 sellerPayout = offer.amount - fee;
+        uint256 total = offer.amount * quantity;
+        uint256 fee = (total * offer.feeBps) / 10_000;
+        uint256 sellerPayout = total - fee;
         uint64 autoRefundAt = uint64(block.timestamp + offer.timelock);
 
         purchaseId = nextPurchaseId++;
@@ -345,7 +349,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
             buyer: msg.sender,
             seller: offer.seller,
             token: offer.token,
-            amount: offer.amount,
+            quantity: quantity,
+            amount: total,
             fee: fee,
             sellerPayout: sellerPayout,
             autoRefundAt: autoRefundAt,
@@ -356,8 +361,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
             disputeLock: false
         });
 
-        IERC20(offer.token).safeTransferFrom(msg.sender, address(this), offer.amount);
-        emit PurchaseCreated(purchaseId, offerId, msg.sender, offer.seller, offer.amount, fee, autoRefundAt);
+        IERC20(offer.token).safeTransferFrom(msg.sender, address(this), total);
+        emit PurchaseCreated(purchaseId, offerId, msg.sender, offer.seller, total, fee, autoRefundAt, quantity);
     }
 
     function confirmReceipt(uint256 purchaseId) external nonReentrant {
@@ -381,23 +386,17 @@ contract Marketplace is Ownable, ReentrancyGuard {
         _paySeller(p, purchaseId);
     }
 
-    /// @notice Продавец отменяет заказ: покупателю возврат минус cancelFeeBps. // cancelFeeBps считаю ненужным.
-    function sellerCancel(uint256 purchaseId) external nonReentrant {
-        Purchase storage p = purchases[purchaseId];
-        if (p.state != PurchaseState.Escrowed) revert BadState();
-        if (p.disputeLock) revert DisputeLocked();
-        if (p.seller != msg.sender) revert NotSeller();
+function sellerCancel(uint256 purchaseId) external nonReentrant {
+    Purchase storage p = purchases[purchaseId];
+    if (p.state != PurchaseState.Escrowed) revert BadState();
+    if (p.disputeLock) revert DisputeLocked();
+    if (p.seller != msg.sender) revert NotSeller();
 
-        uint256 penalty = (p.amount * cancelFeeBps) / 10_000;
-        uint256 refund = p.amount - penalty;
-        p.state = PurchaseState.Settled;
-
-        IERC20 token = IERC20(p.token);
-        if (penalty > 0) token.safeTransfer(feeRecipient, penalty);
-        token.safeTransfer(p.buyer, refund);
-        emit SellerCancelled(purchaseId, penalty, refund);
-        emit Settled(purchaseId, p.buyer, refund, penalty);
-    }
+    p.state = PurchaseState.Settled;
+    IERC20(p.token).safeTransfer(p.buyer, p.amount);
+    emit SellerCancelled(purchaseId, p.amount);
+    emit Settled(purchaseId, p.buyer, p.amount, 0);
+}
 
     /// @notice Keeper: если покупатель не подтвердил и спора нет — возврат покупателю.
     /// Продавец, чтобы не потерять оплату за доставленный товар, должен успеть openDispute.
