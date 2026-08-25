@@ -13,13 +13,12 @@ import {ECDSA} from "./utils/ECDSA.sol";
 contract Marketplace is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    uint16 public constant FEE_BPS_MIN = 10; // 0.1%
-    uint16 public constant FEE_BPS_MAX = 2000; // 20%
-    // Сейчас продавец сам выставляет комисиию в этом диапазоне. Поменять как у cancelFeeBps
+    uint16 public constant MAX_BPS = 10_000; // 100% — предел системы счисления bps
+    uint16 public feeBps; // текущая глобальная комиссия, настраивается owner'ом
     uint8 public constant MAX_MODERATORS = 5; //только в mvp
 
     bytes32 public constant OFFER_TYPEHASH = keccak256(
-        "Offer(address seller,address token,uint256 amount,uint32 timelock,uint16 feeBps,uint64 expiresAt,bytes32 contentHash,string ipfsCid,uint256 quantity,uint256 nonce)"
+        "Offer(address seller,address token,uint256 amount,uint32 timelock,uint64 expiresAt,bytes32 contentHash,string ipfsCid,uint256 quantity,uint256 nonce)"
     );
     bytes32 public constant CONFIRM_TYPEHASH = keccak256("Confirm(uint256 purchaseId,uint256 nonce)");
 
@@ -46,7 +45,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address token;
         uint256 amount; // цена за единицу товара, не общая сумма сделки
         uint32 timelock;
-        uint16 feeBps; //в теории убрать, потому что она одинаковая для всех. Хотя если делать категории может понадобиться.
         uint64 expiresAt; // момент времени, после которого оффер больше нельзя купить. Если 0 — оффер бессрочный.
         bytes32 contentHash; // CID доказывает неизменность файла, а этот хэш доказывает, что именно этот человек выставил этот оффер.
         string ipfsCid;
@@ -94,6 +92,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
     event VerdictDelayUpdated(uint32 verdictDelay); // в зависимости от типа дела может быть необходима разная задержка
     event ModeratorAdded(address indexed moderator);
     event ModeratorRemoved(address indexed moderator);
+    event FeeBpsUpdated(uint16 feeBps);
 
     event OfferCreated(
         uint256 indexed offerId,
@@ -101,7 +100,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address indexed token,
         uint256 amount,
         uint32 timelock,
-        uint16 feeBps,
         uint64 expiresAt,
         bytes32 contentHash,
         string ipfsCid,
@@ -152,14 +150,17 @@ contract Marketplace is Ownable, ReentrancyGuard {
     error InvalidSignature();
     error ZeroAddressError();
 
-    constructor(address initialOwner, address feeRecipient_, uint32 verdictDelay_)
+    constructor(address initialOwner, address feeRecipient_, uint32 verdictDelay_, uint16 feeBps_)
         Ownable(initialOwner)
     {
         if (feeRecipient_ == address(0)) revert ZeroAddressError();
+        if (feeBps_ > MAX_BPS) revert InvalidFee();
         feeRecipient = feeRecipient_;
         verdictDelay = verdictDelay_;
+        feeBps = feeBps_;
         emit FeeRecipientUpdated(feeRecipient_);
         emit VerdictDelayUpdated(verdictDelay_);
+        emit FeeBpsUpdated(feeBps_);
     }
 
     // -------------------------------------------------------------------------
@@ -181,6 +182,12 @@ contract Marketplace is Ownable, ReentrancyGuard {
     function setVerdictDelay(uint32 verdictDelay_) external onlyOwner {
         verdictDelay = verdictDelay_;
         emit VerdictDelayUpdated(verdictDelay_);
+    }
+
+    function setFeeBps(uint16 feeBps_) external onlyOwner {
+        if (feeBps_ > MAX_BPS) revert InvalidFee();
+        feeBps = feeBps_;
+        emit FeeBpsUpdated(feeBps_);
     }
 
     function addModerator(address moderator) external onlyOwner {
@@ -236,13 +243,12 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address token,
         uint256 amount,
         uint32 timelock,
-        uint16 feeBps,
         uint64 expiresAt,
         bytes32 contentHash,
         string calldata ipfsCid,
         uint256 quantity
     ) external returns (uint256 offerId) {
-        return _createOffer(msg.sender, token, amount, timelock, feeBps, expiresAt, contentHash, ipfsCid, quantity);
+        return _createOffer(msg.sender, token, amount, timelock, expiresAt, contentHash, ipfsCid, quantity);
     }
 
     /// @notice Relayer: продавец подписал офчейн, транзакцию шлёт любой адрес.
@@ -252,7 +258,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address token,
         uint256 amount,
         uint32 timelock,
-        uint16 feeBps,
         uint64 expiresAt,
         bytes32 contentHash,
         string calldata ipfsCid,
@@ -267,7 +272,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
                 token,
                 amount,
                 timelock,
-                feeBps,
                 expiresAt,
                 contentHash,
                 keccak256(bytes(ipfsCid)),
@@ -276,7 +280,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
             )
         );
         if (_recover(structHash, signature) != seller) revert InvalidSignature();
-        return _createOffer(seller, token, amount, timelock, feeBps, expiresAt, contentHash, ipfsCid, quantity);
+        return _createOffer(seller, token, amount, timelock, expiresAt, contentHash, ipfsCid, quantity);
     }
 
     /// @notice Останавливает дальнейшие продажи. Уже созданные Purchase не трогает (снимок seller/token/amount/quantity).
@@ -294,7 +298,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address token,
         uint256 amount,
         uint32 timelock,
-        uint16 feeBps,
         uint64 expiresAt,
         bytes32 contentHash,
         string calldata ipfsCid,
@@ -303,7 +306,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
         if (!allowedTokens[token]) revert TokenNotAllowed();
         if (amount == 0) revert InvalidAmount();
         if (timelock == 0) revert InvalidTimelock();
-        if (feeBps < FEE_BPS_MIN || feeBps > FEE_BPS_MAX) revert InvalidFee();
         if (expiresAt != 0 && expiresAt <= block.timestamp) revert OfferExpired();
 
         offerId = nextOfferId++;
@@ -312,7 +314,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
             token: token,
             amount: amount,
             timelock: timelock,
-            feeBps: feeBps,
             expiresAt: expiresAt,
             contentHash: contentHash,
             ipfsCid: ipfsCid,
@@ -321,7 +322,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
             sold: 0
         });
 
-        emit OfferCreated(offerId, seller, token, amount, timelock, feeBps, expiresAt, contentHash, ipfsCid, quantity);
+        emit OfferCreated(offerId, seller, token, amount, timelock, expiresAt, contentHash, ipfsCid, quantity);
     }
 
     // -------------------------------------------------------------------------
@@ -339,7 +340,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         offer.sold += quantity;
 
         uint256 total = offer.amount * quantity;
-        uint256 fee = (total * offer.feeBps) / 10_000;
+        uint256 fee = (total * feeBps) / 10_000;
         uint256 sellerPayout = total - fee;
         uint64 autoRefundAt = uint64(block.timestamp + offer.timelock);
 
