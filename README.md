@@ -1,4 +1,5 @@
 To do:
+
 - Регистрация через стейк, а не только по почте
 - Добавить в offer поле quantity, чтобы один и тот же товар можно было продавать многократно. if quantity == 0: бесконечное количество
 
@@ -14,11 +15,11 @@ Foundry-проект ядра эскроу по роудмапу и сценар
 
 ## Контракты
 
-| Файл | Роль |
-|---|---|
-| `src/Marketplace.sol` | OfferRegistry + Escrow/Purchase + MVP-споры |
+| Файл                         | Роль                                                                  |
+| ---------------------------- | --------------------------------------------------------------------- |
+| `src/Marketplace.sol`        | OfferRegistry + Escrow/Purchase + MVP-споры                           |
 | `src/CuratorBanRegistry.sol` | Per-interface реестр банов (информационный, не влияет на Marketplace) |
-| `src/mocks/MockERC20.sol` | Токен для тестов |
+| `src/mocks/MockERC20.sol`    | Токен для тестов                                                      |
 
 **В MVP не входит** полный децентрализованный суд (стейкинг, commit-reveal, VRF, апелляции) и глобальный кросс-интерфейсный бан.
 
@@ -39,7 +40,7 @@ Foundry-проект ядра эскроу по роудмапу и сценар
 
 **Бан не блокирует действия в `Marketplace.sol`** (`createOffer`, `purchase` и т.д. проходят как обычно) — это сигнал для фронтенда/бэкенда, что скрывать в своём каталоге.
 
-1. `setBan(curator, user, bannedUntil)` — куратор или его делегат банит/разбанивает. `bannedUntil = 0` — снять бан, `BAN_PERMANENT` (`type(uint64).max`) — навсегда, иное значение — таймстамп истечения (временный бан).
+1. ``setBan(curator, user, bannedUntil, reason)` — куратор или его делегат банит/разбанивает. `bannedUntil = 0` — снять бан, `BAN_PERMANENT` (`type(uint64).max`) — навсегда, иное значение — таймстамп истечения (временный бан). `reason` — свободный текст (ссылка на централизованное доказательство, IPFS CID или описание причины), хранится только в событии `BanStatusChanged`, не в storage. Повторный вызов с тем же `bannedUntil` и новым `reason` — штатный способ обновить/дополнить доказательства без изменения статуса бана.
 2. `setDelegate(delegate, active)` — куратор мгновенно включает/выключает право делегата вызывать `setBan` от его имени. Без задержки: задержка не защищает от компрометации ключа куратора, поскольку `setBan` вызывается тем же ключом напрямую, минуя делегирование.
 3. `setGuardian(guardian, active)` / `pause(curator)` / `unpause()` — независимый от куратора guardian-адрес может мгновенно заморозить `setBan` для куратора при подозрении на компрометацию его ключа. Снять паузу может только сам куратор (не guardian) — иначе скомпрометированный guardian стал бы отдельным вектором атаки.
 4. `isBanned(curator, user)` — view-хелпер для чтения статуса.
@@ -56,9 +57,9 @@ EIP-712: оффер и подтверждение получения можно 
 
 **Marketplace**: `OfferCreated`, `OfferCancelled`, `PurchaseCreated`, `ReceiptConfirmed`, `SellerCancelled`, `RefundedToBuyer`, `DisputeOpened`, `DisputeVote`, `ReceiverSet`, `Settled`.
 
-**CuratorBanRegistry**: `BanStatusChanged`, `DelegateUpdated`, `GuardianUpdated`, `PausedByGuardian`, `UnpausedByCurator`.
+**CuratorBanRegistry**: `BanStatusChanged(curator, user, actor, bannedUntil, reason)`, `DelegateUpdated`, `GuardianUpdated`, `PausedByGuardian`, `UnpausedByCurator`.
 
-Бэкенду нужны зеркальные таблицы `bans(curator, user, banned_until)`, `delegates(curator, delegate, active)`, `guardians(curator, guardian, active)`, `curator_paused(curator, paused)` — читаются обычным SQL при отдаче каталога, без RPC-запросов в блокчейн на каждый рендер.
+Бэкенду нужны зеркальные таблицы `bans(curator, user, banned_until, reason)`, `delegates(curator, delegate, active)`, `guardians(curator, guardian, active)`, `curator_paused(curator, paused)` — читаются обычным SQL при отдаче каталога, без RPC-запросов в блокчейн на каждый рендер.
 
 Автовыдача только после `PurchaseCreated`, секрет **не** кладётся в IPFS.
 
@@ -91,3 +92,4 @@ forge script script/Deploy.s.sol --rpc-url $RPC --broadcast
 - Делегирование права бана — мгновенное, без задержки активации (задержка не защищает от компрометации ключа куратора, см. раздел «Бан пользователей»).
 - Защита от компрометации ключа куратора — guardian-пауза (мгновенная заморозка `setBan`) и/или мультисиг в роли куратора; не задержка.
 - Глобальный кросс-интерфейсный бан не реализован — открытый вопрос.
+- Причина бана (`reason`) — свободный текст в событии, без enum/типизации и без хранения в storage; лимит длины (`MAX_REASON_LENGTH = 512`) задан на уровне протокола, а не только на бэкенде.
