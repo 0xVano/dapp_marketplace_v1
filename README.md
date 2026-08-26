@@ -1,6 +1,5 @@
 To do:
 
-- Регистрация через стейк, а не только по почте
 - Добавить возможность возврата части суммы в споре
 
 # dApp Marketplace — смарт-контракты (MVP)
@@ -15,11 +14,12 @@ Foundry-проект ядра эскроу по роудмапу и сценар
 
 ## Контракты
 
-| Файл                         | Роль                                                                  |
-| ---------------------------- | --------------------------------------------------------------------- |
-| `src/Marketplace.sol`        | OfferRegistry + Escrow/Purchase + MVP-споры                           |
-| `src/CuratorBanRegistry.sol` | Per-interface реестр банов (информационный, не влияет на Marketplace) |
-| `src/mocks/MockERC20.sol`    | Токен для тестов                                                      |
+| Файл                           | Роль                                                                  |
+| ------------------------------ | --------------------------------------------------------------------- |
+| `src/Marketplace.sol`          | OfferRegistry + Escrow/Purchase + MVP-споры                           |
+| `src/CuratorBanRegistry.sol`   | Per-interface реестр банов (информационный, не влияет на Marketplace) |
+| `src/mocks/MockERC20.sol`      | Токен для тестов                                                      |
+| `src/CuratorStakeRegistry.sol` | Per-interface anti-sybil стейк-регистрация                            |
 
 **В MVP не входит** полный децентрализованный суд (стейкинг, commit-reveal, VRF, апелляции) и глобальный кросс-интерфейсный бан.
 
@@ -49,6 +49,24 @@ Foundry-проект ядра эскроу по роудмапу и сценар
 
 **В MVP не входит**: глобальный (сквозной для всех интерфейсов) бан за подтверждённое мошенничество — открытый вопрос, решается отдельно (вероятно через `Ownable`/модераторский кворум `Marketplace.sol`, вне этого permissionless-реестра).
 
+
+
+## Стейк-регистрация (permissionless, per-interface, anti-sybil)
+
+Отдельный контракт `CuratorStakeRegistry`, не связан с эскроу-логикой и спорами `Marketplace.sol`. Альтернатива подтверждению почты: пользователь (продавец **или** покупатель — контракт не различает роли) вносит возвращаемый стейк в пользу конкретного куратора (интерфейса). Пространство имён — как в `CuratorBanRegistry`: `curator = msg.sender` при настройке, поэтому один пользователь может независимо стейкать сразу у нескольких кураторов.
+
+
+- `setTokenConfig(token, accepted, minStakeAmount)` — куратор сам решает, какие токены принимает и какой минимальный стейк считает достаточным для eligibility.
+- `setUnstakeCooldown(cooldown)` — куратор задаёт задержку между `requestUnstake` и `withdraw`; это окно, в течение которого куратор/делегат ещё может успеть вызвать `slash` до вывода средств.
+- `stake(curator, token, amount)` / `requestUnstake(curator)` / `withdraw(curator)` — внесение и возврат стейка пользователем.
+- `isEligible(curator, user)` — view-хелпер для бэкенда: читается вместо (или вместе с) флагом `emailVerified` при решении, допускать ли пользователя к каталогу.
+- `slash(curator, user, amount, to)` — изъятие стейка. Вызывает сам куратор или его делегат (`setDelegate`, без задержки активации — та же причина, что и у `CuratorBanRegistry`: задержка не защищает от компрометации ключа). **Модераторов и голосования внутри контракта нет** — если фронтенду нужен коллегиальный вердикт, `delegate` указывается на multisig (Safe) или отдельный контракт со своей логикой модерации.
+- `setGuardian(guardian, active)` / `pause(curator)` / `unpause()` — тот же guardian-паттерн, что и в `CuratorBanRegistry`, но здесь пауза блокирует `slash`, а не `stake`/`withdraw` — пользователь всегда может вывести свои деньги (после кулдауна), даже если ключ куратора скомпрометирован и приостановлен.
+
+**Рекомендация по безопасности**: как и для `CuratorBanRegistry` — если куратор является ценным адресом, разумнее сделать его мультисигом (Safe), а не полагаться только на guardian-паузу.
+
+**В MVP не входит**: ограничения на адрес-получатель изъятого стейка (`to` в `slash`) — контракт не мешает куратору направить конфискованное себе в казну; сдерживающий фактор — репутация фронтенда, а не код.
+
 ## Relayer
 
 EIP-712: оффер и подтверждение получения можно подписать офчейн; транзакцию публикует любой адрес (relayer платит газ).
@@ -59,7 +77,9 @@ EIP-712: оффер и подтверждение получения можно 
 
 **CuratorBanRegistry**: `BanStatusChanged`, `DelegateUpdated`, `GuardianUpdated`, `PausedByGuardian`, `UnpausedByCurator`.
 
-Бэкенду нужны зеркальные таблицы `bans(curator, user, banned_until)`, `delegates(curator, delegate, active)`, `guardians(curator, guardian, active)`, `curator_paused(curator, paused)` — читаются обычным SQL при отдаче каталога, без RPC-запросов в блокчейн на каждый рендер.
+**CuratorStakeRegistry**: `TokenConfigUpdated`, `UnstakeCooldownUpdated`, `DelegateUpdated`, `GuardianUpdated`, `PausedByGuardian`, `UnpausedByCurator`, `Staked`, `UnstakeRequested`, `Withdrawn`, `Slashed`.
+
+Бэкенду нужны зеркальные таблицы `bans(curator, user, banned_until)`, `delegates(curator, delegate, active)`, `guardians(curator, guardian, active)`, `curator_paused(curator, paused)`,`stakes(curator, user, token, amount, unlock_at)`, `token_config(curator, token, accepted, min_stake)` — читаются обычным SQL при отдаче каталога, без RPC-запросов в блокчейн на каждый рендер.
 
 Автовыдача только после `PurchaseCreated`, секрет **не** кладётся в IPFS.
 
@@ -91,3 +111,4 @@ forge script script/Deploy.s.sol --rpc-url $RPC --broadcast
 - Защита от компрометации ключа куратора — guardian-пауза (мгновенная заморозка `setBan`) и/или мультисиг в роли куратора; не задержка.
 - Бан — permissionless и per-curator (namespace = `msg.sender`), без влияния на ончейн-логику Marketplace.
 - Глобальный кросс-интерфейсный бан не реализован и не будет. Каждый интерфейс решает сам кого банить а кого нет.
+- 
