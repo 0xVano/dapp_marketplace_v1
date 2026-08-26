@@ -150,6 +150,12 @@ contract Marketplace is Ownable, ReentrancyGuard {
     error InvalidSignature();
     error ZeroAddressError();
 
+    /// @notice Инициализирует маркетплейс, задаёт владельца, получателя комиссий и глобальные экономические параметры
+    /// @dev Вызывается один раз при деплое. Наследует Ownable(initialOwner). Проверяет feeRecipient != 0 и feeBps <= MAX_BPS
+    /// @param initialOwner адрес будущего owner'а (получает права onlyOwner)
+    /// @param feeRecipient_ адрес получателя комиссий протокола
+    /// @param verdictDelay_ задержка в секундах между фиксацией вердикта модераторов и возможностью executeVerdict
+    /// @param feeBps_ комиссия протокола в базисных пунктах (bps, 100 = 1%, 10_000 = 100%)
     constructor(address initialOwner, address feeRecipient_, uint32 verdictDelay_, uint16 feeBps_)
         Ownable(initialOwner)
     {
@@ -167,29 +173,45 @@ contract Marketplace is Ownable, ReentrancyGuard {
     // Admin
     // -------------------------------------------------------------------------
 
+    /// @notice Разрешает или запрещает использование ERC20-токена для создания офферов и покупок
+    /// @dev Доступ только у owner. Записывает флаг в allowedTokens[token]
+    /// @param token адрес ERC20-контракта
+    /// @param allowed true — разрешить токен, false — запретить
     function setAllowedToken(address token, bool allowed) external onlyOwner {
         if (token == address(0)) revert ZeroAddressError();
         allowedTokens[token] = allowed;
         emit TokenAllowed(token, allowed);
     }
 
+    /// @notice Меняет адрес получателя комиссий протокола
+    /// @dev Доступ только у owner. Новый адрес применяется ко всем будущим выплатам _paySeller
+    /// @param feeRecipient_ новый адрес получателя комиссий, не может быть address(0)
     function setFeeRecipient(address feeRecipient_) external onlyOwner {
         if (feeRecipient_ == address(0)) revert ZeroAddressError();
         feeRecipient = feeRecipient_;
         emit FeeRecipientUpdated(feeRecipient_);
     }
 
+    /// @notice Меняет глобальную задержку исполнения вердикта модераторов
+    /// @dev Доступ только у owner. Влияет на verdictDelayUntil, который выставляется в _setReceiver
+    /// @param verdictDelay_ новая задержка в секундах после фиксации большинства голосов до executeVerdict
     function setVerdictDelay(uint32 verdictDelay_) external onlyOwner {
         verdictDelay = verdictDelay_;
         emit VerdictDelayUpdated(verdictDelay_);
     }
 
+    /// @notice Меняет глобальную ставку комиссии протокола
+    /// @dev Доступ только у owner. Применяется при каждой новой покупке: fee = total * feeBps / 10_000
+    /// @param feeBps_ новая ставка в базисных пунктах, должна быть <= MAX_BPS (10_000)
     function setFeeBps(uint16 feeBps_) external onlyOwner {
         if (feeBps_ > MAX_BPS) revert InvalidFee();
         feeBps = feeBps_;
         emit FeeBpsUpdated(feeBps_);
     }
 
+    /// @notice Добавляет нового модератора в пул арбитров
+    /// @dev Доступ только у owner. Проверяет лимит MAX_MODERATORS и отсутствие дубликата. Пушит в массив moderators и ставит isModerator=true
+    /// @param moderator адрес добавляемого модератора, не может быть address(0)
     function addModerator(address moderator) external onlyOwner {
         if (moderator == address(0)) revert ZeroAddressError();
         if (isModerator[moderator]) revert ModeratorExists();
@@ -199,6 +221,9 @@ contract Marketplace is Ownable, ReentrancyGuard {
         emit ModeratorAdded(moderator);
     }
 
+    /// @notice Удаляет модератора из пула арбитров
+    /// @dev Доступ только у owner. Использует swap-and-pop для удаления из массива moderators за O(n) поиск + O(1) удаление
+    /// @param moderator адрес удаляемого модератора, должен существовать в isModerator
     function removeModerator(address moderator) external onlyOwner {
         if (!isModerator[moderator]) revert NotAModerator();
         isModerator[moderator] = false;
@@ -213,16 +238,21 @@ contract Marketplace is Ownable, ReentrancyGuard {
         emit ModeratorRemoved(moderator);
     }
 
+    /// @notice Возвращает текущее количество активных модераторов
+    /// @dev View-функция без изменения состояния, читает moderators.length
     function moderatorCount() public view returns (uint256) {
         return moderators.length;
     }
 
+    /// @notice Вычисляет порог простого большинства для голосования модераторов
+    /// @dev Формула n/2 + 1, при n==0 возвращает 0 чтобы избежать деления на ноль и блокировки логики vote
     function majorityThreshold() public view returns (uint256) {
         uint256 n = moderators.length;
         return n == 0 ? 0 : n / 2 + 1;
     }
 
-    /// @notice Это защита от cross-contract/cross-chain replay, обязательная часть стандарта EIP-712
+    /// @notice Вычисляет EIP-712 domain separator для защиты подписей от кросс-контрактного и кросс-чейн replay
+    /// @dev Хэширует EIP712Domain(name="dApp Marketplace", version="1", chainId, verifyingContract=address(this))
     function domainSeparator() public view returns (bytes32) {
         return keccak256(
             abi.encode(
@@ -239,6 +269,16 @@ contract Marketplace is Ownable, ReentrancyGuard {
     // OfferRegistry
     // -------------------------------------------------------------------------
 
+    /// @notice Создаёт новый оффер напрямую от имени вызывающего продавца
+    /// @dev Обёртка над _createOffer, передаёт msg.sender как seller. Требует что токен разрешён в allowedTokens
+    /// @param token адрес ERC20-токена расчётов по офферу
+    /// @param amount цена за одну единицу товара в минимальных единицах токена
+    /// @param timelock длительность эскроу в секундах (период до autoRefundAt)
+    /// @param expiresAt unix-время истечения оффера; 0 — бессрочный оффер
+    /// @param contentHash keccak256-хэш контента/описания для доказательства авторства оффера
+    /// @param ipfsCid CID в IPFS с метаданными/файлами товара
+    /// @param quantity объём лота; 0 — бесконечный запас, иначе лимит единиц на продажу
+    /// @return offerId идентификатор созданного оффера (инкремент nextOfferId)
     function createOffer(
         address token,
         uint256 amount,
@@ -251,8 +291,18 @@ contract Marketplace is Ownable, ReentrancyGuard {
         return _createOffer(msg.sender, token, amount, timelock, expiresAt, contentHash, ipfsCid, quantity);
     }
 
-    /// @notice Relayer: продавец подписал офчейн, транзакцию шлёт любой адрес.
-    /// @dev `quantity` входит в EIP-712 `OFFER_TYPEHASH`; добавление поля меняет typehash-строку и инвалидирует старые подписи.
+    /// @notice Создаёт оффер через офчейн-подпись продавца (мета-транзакция/релеер)
+    /// @dev Проверяет EIP-712 подпись seller'а по структуре OFFER_TYPEHASH с nonce для защиты от replay, затем делегирует в _createOffer. Инкрементирует nonces[seller]
+    /// @param seller адрес продавца, чья подпись проверяется
+    /// @param token адрес ERC20-токена расчётов
+    /// @param amount цена за единицу товара
+    /// @param timelock длительность эскроу в секундах
+    /// @param expiresAt unix-время истечения оффера; 0 — бессрочно
+    /// @param contentHash хэш контента для привязки оффера к автору
+    /// @param ipfsCid CID в IPFS с описанием товара
+    /// @param quantity объём лота; 0 — бесконечно
+    /// @param signature EIP-712 подпись seller'а над OFFER_TYPEHASH (seller, token, amount, timelock, expiresAt, contentHash, keccak256(ipfsCid), quantity, nonce)
+    /// @return offerId идентификатор созданного оффера
     function createOfferWithSig(
         address seller,
         address token,
@@ -283,8 +333,9 @@ contract Marketplace is Ownable, ReentrancyGuard {
         return _createOffer(seller, token, amount, timelock, expiresAt, contentHash, ipfsCid, quantity);
     }
 
-    /// @notice Останавливает дальнейшие продажи. Уже созданные Purchase не трогает (снимок seller/token/amount/quantity).
-    /// Непроданный остаток сгорает. Частичная отмена (оставить в продаже N штук) — отдельное расширение, не в MVP.
+    /// @notice Отменяет активный оффер продавца, останавливая дальнейшие продажи
+    /// @dev Ставит active=false, уже созданные Purchase не затрагиваются. Непроданный остаток сгорает безвозвратно
+    /// @param offerId идентификатор отменяемого оффера, caller должен быть offers[offerId].seller
     function cancelOffer(uint256 offerId) external {
         Offer storage offer = offers[offerId];
         if (offer.seller != msg.sender) revert NotSeller();
@@ -293,6 +344,17 @@ contract Marketplace is Ownable, ReentrancyGuard {
         emit OfferCancelled(offerId);
     }
 
+    /// @notice Внутренний конструктор оффера с валидацией и записью в storage
+    /// @dev Проверяет allowedTokens, amount!=0, timelock!=0, не истёк ли expiresAt. Инкрементирует nextOfferId и эмитит OfferCreated
+    /// @param seller адрес продавца (msg.sender или восстановленный из подписи)
+    /// @param token адрес ERC20-токена
+    /// @param amount цена за единицу
+    /// @param timelock длительность эскроу в секундах
+    /// @param expiresAt unix-время истечения; 0 — бессрочно, иначе должно быть > block.timestamp
+    /// @param contentHash хэш контента/описания
+    /// @param ipfsCid CID в IPFS
+    /// @param quantity объём лота; 0 — бесконечный
+    /// @return offerId идентификатор созданного оффера
     function _createOffer(
         address seller,
         address token,
@@ -329,6 +391,11 @@ contract Marketplace is Ownable, ReentrancyGuard {
     // Escrow / Purchase
     // -------------------------------------------------------------------------
 
+    /// @notice Покупает указанное количество единиц по офферу, блокируя средства в эскроу
+    /// @dev Проверяет активность и срок оффера, лимит quantity, инкрементирует sold, рассчитывает fee/sellerPayout/autoRefundAt, делает safeTransferFrom покупателя на контракт. Защищена от реентрантности
+    /// @param offerId идентификатор покупаемого оффера
+    /// @param quantity количество единиц к покупке, должно быть >0 и не превышать остаток (если quantity оффера !=0)
+    /// @return purchaseId идентификатор созданной сделки эскроу
     function purchase(uint256 offerId, uint256 quantity) external nonReentrant returns (uint256 purchaseId) {
         if (quantity == 0) revert InvalidQuantity();
 
@@ -366,10 +433,18 @@ contract Marketplace is Ownable, ReentrancyGuard {
         emit PurchaseCreated(purchaseId, offerId, msg.sender, offer.seller, total, fee, autoRefundAt, quantity);
     }
 
+    /// @notice Подтверждает получение товара покупателем и выплачивает средства продавцу
+    /// @dev Вызывает внутренний _confirm с msg.sender как buyer. Требует состояние Escrowed и отсутствие disputeLock. Защищена от реентрантности
+    /// @param purchaseId идентификатор сделки эскроу
     function confirmReceipt(uint256 purchaseId) external nonReentrant {
         _confirm(purchaseId, msg.sender);
     }
 
+    /// @notice Подтверждает получение товара через офчейн-подпись покупателя (релеер)
+    /// @dev Проверяет EIP-712 подпись buyer'а по CONFIRM_TYPEHASH(purchaseId, nonce), инкрементирует nonces[buyer], затем вызывает _confirm. Защищена от реентрантности
+    /// @param purchaseId идентификатор подтверждаемой сделки
+    /// @param buyer адрес покупателя, чья подпись проверяется
+    /// @param signature EIP-712 подпись buyer'а над Confirm(purchaseId, nonce)
     function confirmReceiptWithSig(uint256 purchaseId, address buyer, bytes calldata signature) external nonReentrant {
         uint256 nonce = nonces[buyer]++;
         bytes32 structHash = keccak256(abi.encode(CONFIRM_TYPEHASH, purchaseId, nonce));
@@ -377,6 +452,10 @@ contract Marketplace is Ownable, ReentrancyGuard {
         _confirm(purchaseId, buyer);
     }
 
+    /// @notice Внутренняя логика подтверждения получения: валидирует право покупателя и переводит средства
+    /// @dev Проверяет state==Escrowed, !disputeLock, p.buyer==buyer. Эмитит ReceiptConfirmed и делегирует выплату в _paySeller
+    /// @param purchaseId идентификатор сделки
+    /// @param buyer адрес покупателя, который подтверждает получение
     function _confirm(uint256 purchaseId, address buyer) internal {
         Purchase storage p = purchases[purchaseId];
         if (p.state != PurchaseState.Escrowed) revert BadState();
@@ -387,20 +466,24 @@ contract Marketplace is Ownable, ReentrancyGuard {
         _paySeller(p, purchaseId);
     }
 
-function sellerCancel(uint256 purchaseId) external nonReentrant {
-    Purchase storage p = purchases[purchaseId];
-    if (p.state != PurchaseState.Escrowed) revert BadState();
-    if (p.disputeLock) revert DisputeLocked();
-    if (p.seller != msg.sender) revert NotSeller();
+    /// @notice Позволяет продавцу добровольно отменить сделку и вернуть полную сумму покупателю
+    /// @dev Доступен только seller'у в состоянии Escrowed без disputeLock. Ставит Settled и делает safeTransfer всей суммы p.amount покупателю. Защищена от реентрантности
+    /// @param purchaseId идентификатор отменяемой сделки
+    function sellerCancel(uint256 purchaseId) external nonReentrant {
+        Purchase storage p = purchases[purchaseId];
+        if (p.state != PurchaseState.Escrowed) revert BadState();
+        if (p.disputeLock) revert DisputeLocked();
+        if (p.seller != msg.sender) revert NotSeller();
 
-    p.state = PurchaseState.Settled;
-    IERC20(p.token).safeTransfer(p.buyer, p.amount);
-    emit SellerCancelled(purchaseId, p.amount);
-    emit Settled(purchaseId, p.buyer, p.amount, 0);
-}
+        p.state = PurchaseState.Settled;
+        IERC20(p.token).safeTransfer(p.buyer, p.amount);
+        emit SellerCancelled(purchaseId, p.amount);
+        emit Settled(purchaseId, p.buyer, p.amount, 0);
+    }
 
-    /// @notice Keeper: если покупатель не подтвердил и спора нет — возврат покупателю.
-    /// Продавец, чтобы не потерять оплату за доставленный товар, должен успеть openDispute.
+    /// @notice Возвращает средства покупателю после истечения таймлока, если товар не подтверждён и спора нет
+    /// @dev Может вызвать keeper/любой адрес. Требует state==Escrowed, !disputeLock, block.timestamp >= autoRefundAt. Ставит Settled и переводит p.amount покупателю. Защищена от реентрантности
+    /// @param purchaseId идентификатор просроченной сделки
     function refundExpired(uint256 purchaseId) external nonReentrant {
         Purchase storage p = purchases[purchaseId];
         if (p.state != PurchaseState.Escrowed) revert BadState();
@@ -417,6 +500,10 @@ function sellerCancel(uint256 purchaseId) external nonReentrant {
     // MVP dispute: trusted moderators, simple majority, no staking/appeals
     // -------------------------------------------------------------------------
 
+    /// @notice Открывает спор по сделке, блокируя эскроу от confirm/refund до вердикта
+    /// @dev Доступен только buyer или seller сделки в состоянии Escrowed. Переводит в Disputed, ставит disputeLock=true и сохраняет evidenceHash
+    /// @param purchaseId идентификатор оспариваемой сделки
+    /// @param evidenceHash keccak256-хэш пакета доказательств (IPFS/чат/файлы), 0 если без доказательств
     function openDispute(uint256 purchaseId, bytes32 evidenceHash) external {
         Purchase storage p = purchases[purchaseId];
         if (p.state != PurchaseState.Escrowed) revert BadState();
@@ -429,7 +516,10 @@ function sellerCancel(uint256 purchaseId) external nonReentrant {
         emit DisputeOpened(purchaseId, msg.sender, evidenceHash);
     }
 
-    /// @notice Голос модератора. По достижении большинства вызывается set_receiver.
+    /// @notice Фиксирует голос модератора в споре; при достижении большинства автоматически выставляет pendingReceiver
+    /// @dev Требует isModerator[msg.sender], state==Disputed, не голосовал ранее. Инкрементирует votesForSeller/Buyer и вызывает _setReceiver при majorityThreshold
+    /// @param purchaseId идентификатор оспариваемой сделки
+    /// @param forSeller true — голос за продавца, false — за покупателя
     function vote(uint256 purchaseId, bool forSeller) external {
         if (!isModerator[msg.sender]) revert NotModerator();
         Purchase storage p = purchases[purchaseId];
@@ -451,6 +541,11 @@ function sellerCancel(uint256 purchaseId) external nonReentrant {
         }
     }
 
+    /// @notice Внутренняя фиксация победителя спора и запуск задержки перед выплатой
+    /// @dev Ставит pendingReceiver, снимает disputeLock, выставляет verdictDelayUntil = block.timestamp + verdictDelay
+    /// @param purchaseId идентификатор сделки
+    /// @param p storage-указатель на структуру Purchase
+    /// @param receiver выбранный получатель средств (Seller или Buyer)
     function _setReceiver(uint256 purchaseId, Purchase storage p, Receiver receiver) internal {
         p.pendingReceiver = receiver;
         p.disputeLock = false;
@@ -458,7 +553,9 @@ function sellerCancel(uint256 purchaseId) external nonReentrant {
         emit ReceiverSet(purchaseId, receiver, p.verdictDelayUntil);
     }
 
-    /// @notice Выплата после вердикта (и повторного timelock/verdictDelay). Вызывает keeper или любая сторона.
+    /// @notice Исполняет вердикт модераторов после истечения verdictDelay, выплачивая средства победителю
+    /// @dev Требует state==Disputed, pendingReceiver!=None, block.timestamp >= verdictDelayUntil. При Seller вызывает _paySeller, при Buyer переводит всю сумму покупателю. Защищена от реентрантности
+    /// @param purchaseId идентификатор сделки с вынесенным вердиктом
     function executeVerdict(uint256 purchaseId) external nonReentrant {
         Purchase storage p = purchases[purchaseId];
         if (p.state != PurchaseState.Disputed) revert BadState();
@@ -474,6 +571,10 @@ function sellerCancel(uint256 purchaseId) external nonReentrant {
         }
     }
 
+    /// @notice Внутренняя выплата продавцу с удержанием комиссии протокола
+    /// @dev Ставит state=Settled, переводит fee на feeRecipient и sellerPayout на seller, эмитит Settled
+    /// @param p storage-указатель на структуру Purchase с заполненными fee/sellerPayout/token
+    /// @param purchaseId идентификатор сделки для события Settled
     function _paySeller(Purchase storage p, uint256 purchaseId) internal {
         p.state = PurchaseState.Settled;
         IERC20 token = IERC20(p.token);
@@ -482,6 +583,11 @@ function sellerCancel(uint256 purchaseId) external nonReentrant {
         emit Settled(purchaseId, p.seller, p.sellerPayout, p.fee);
     }
 
+    /// @notice Восстанавливает адрес подписанта из EIP-712 дайджеста
+    /// @dev Собирает digest = keccak256("\x19\x01" || domainSeparator() || structHash) и вызывает ECDSA.recover
+    /// @param structHash хэш структуры (OFFER_TYPEHASH или CONFIRM_TYPEHASH) с уже закодированными полями
+    /// @param signature ECDSA-подпись в формате 65 байт (r,s,v) или 64 байта (EIP-2098)
+    /// @return адрес восстановившего подписанта
     function _recover(bytes32 structHash, bytes calldata signature) internal view returns (address) {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator(), structHash));
         return ECDSA.recover(digest, signature);
