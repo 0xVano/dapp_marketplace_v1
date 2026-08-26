@@ -13,8 +13,27 @@ pragma solidity ^0.8.24;
 ///      ключом напрямую и мгновенно, минуя делегирование. Реальная защита —
 ///      либо curator = мультисиг (Safe), либо guardian-пауза ниже, либо
 ///      анализ аномалий на бэкенде (эвристика вне контракта).
+///
+///      Причина бана (`reason`) хранится ТОЛЬКО в event, не в storage:
+///      она не нужна ни одной ончейн-функции (isBanned читает лишь
+///      bannedUntil), поэтому это чистые calldata-затраты (~16 gas/байт
+///      ненулевой, ~4 gas/байт нулевой) вместо дорогого SSTORE. Индексатор
+///      бэкенда обязан слушать BanStatusChanged и класть reason в свою
+///      таблицу — это уже предусмотрено роадмапом (зеркальные SQL-таблицы).
+///
+///      Формат reason не валидируется контрактом: это может быть свободный
+///      текст, ссылка на централизованный хостинг доказательств (скриншоты,
+///      переписка) или IPFS CID — выбор куратора. Отсутствие enum/типизации
+///      — осознанный компромисс: другие кураторы не смогут программно
+///      фильтровать баны по категории нарушения без парсинга строки или
+///      договорной конвенции (например "fraud: <ссылка>").
 contract CuratorBanRegistry {
     uint64 public constant BAN_PERMANENT = type(uint64).max; // sentinel = "забанен навсегда"
+
+    /// @notice Мягкий лимит на длину reason, чтобы куратор не раздувал
+    /// calldata произвольно и не переполнял бэкенд-таблицы индексатора.
+    /// Это лимит протокола, а не рекомендация — при превышении revert.
+    uint256 public constant MAX_REASON_LENGTH = 512;
 
     /// curator => user => момент времени, до которого действует бан.
     /// 0 — не забанен, BAN_PERMANENT — навсегда, иначе — таймстамп истечения.
@@ -29,7 +48,15 @@ contract CuratorBanRegistry {
     /// curator => приостановлен ли setBan (guardian'ом, из-за подозрения на компрометацию)
     mapping(address => bool) public paused;
 
-    event BanStatusChanged(address indexed curator, address indexed user, address indexed actor, uint64 bannedUntil);
+    /// @param reason Свободный текст: ссылка на доказательства (централизованный
+    /// хостинг, IPFS CID) либо описание причины. Не хранится в storage — см. @dev.
+    event BanStatusChanged(
+        address indexed curator,
+        address indexed user,
+        address indexed actor,
+        uint64 bannedUntil,
+        string reason
+    );
     event DelegateUpdated(address indexed curator, address indexed delegate, bool active);
     event GuardianUpdated(address indexed curator, address indexed guardian, bool active);
     event PausedByGuardian(address indexed curator, address indexed guardian);
@@ -38,17 +65,23 @@ contract CuratorBanRegistry {
     error NotAuthorized();
     error CuratorPaused();
     error ZeroAddress();
+    error ReasonTooLong();
 
     // -----------------------------------------------------------------
     // Баны
     // -----------------------------------------------------------------
 
     /// @param bannedUntil_ 0 — снять бан, BAN_PERMANENT — навсегда, иначе — unix-время истечения.
-    function setBan(address curator, address user, uint64 bannedUntil_) external {
+    /// @param reason Причина/доказательство бана (ссылка, CID или текст). Может быть пустой строкой.
+    /// @dev Повторный вызов с тем же bannedUntil_, но новым reason — штатный способ
+    ///      обновить/дополнить доказательства без изменения статуса бана: отдельная
+    ///      функция для этого не нужна, setBan уже безусловно перезаписывает mapping.
+    function setBan(address curator, address user, uint64 bannedUntil_, string calldata reason) external {
         if (paused[curator]) revert CuratorPaused();
         if (msg.sender != curator && !isDelegate[curator][msg.sender]) revert NotAuthorized();
+        if (bytes(reason).length > MAX_REASON_LENGTH) revert ReasonTooLong();
         bannedUntil[curator][user] = bannedUntil_;
-        emit BanStatusChanged(curator, user, msg.sender, bannedUntil_);
+        emit BanStatusChanged(curator, user, msg.sender, bannedUntil_, reason);
     }
 
     function isBanned(address curator, address user) external view returns (bool) {
