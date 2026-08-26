@@ -18,7 +18,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
     uint8 public constant MAX_MODERATORS = 5; //только в mvp
 
     bytes32 public constant OFFER_TYPEHASH = keccak256(
-        "Offer(address seller,address token,uint256 amount,uint32 timelock,uint64 expiresAt,bytes32 contentHash,string ipfsCid,uint256 quantity,uint256 nonce)"
+        "Offer(address seller,address token,uint256 amount,uint32 timelock,uint64 expiresAt,bytes32 contentHash,string ipfsCid,uint256 offerQuantity,uint256 nonce)"
     );
     bytes32 public constant CONFIRM_TYPEHASH = keccak256("Confirm(uint256 purchaseId,uint256 nonce)");
 
@@ -49,8 +49,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
         bytes32 contentHash; // CID доказывает неизменность файла, а этот хэш доказывает, что именно этот человек выставил этот оффер.
         string ipfsCid;
         bool active; // true при создании; false только при cancelOffer (дальнейшие продажи стоп, непроданный остаток сгорает)
-        uint256 quantity; // объём лота: 0 = бесконечно. Не декрементируется при покупке — иначе 0 стало бы неотличимо от «бесконечно»
-        uint256 sold; // сколько единиц уже купили. remaining = quantity == 0 ? ∞ : quantity - sold
+        uint256 offerQuantity; // объём лота: 0 = бесконечно. Не декрементируется при покупке — иначе 0 стало бы неотличимо от «бесконечно»
+        uint256 sold; // сколько единиц уже купили. remaining = offerQuantity == 0 ? ∞ : offerQuantity - sold
     }
 
     struct Purchase {
@@ -58,8 +58,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
         address buyer; //нельзя менять на msg.sender потому что может быть релеер
         address seller; //достать из Offer? Как и 4 строки ниже
         address token; 
-        uint256 quantity; // сколько единиц куплено в этой сделке (batch)
-        uint256 amount; // сумма эскроу = offer.amount (цена за единицу) * quantity
+        uint256 purchaseQuantity; // сколько единиц куплено в этой сделке (batch)
+        uint256 amount; // сумма эскроу = offer.amount (цена за единицу) * purchaseQuantity
         uint256 fee;
         uint256 sellerPayout;
         uint64 autoRefundAt; //Это момент block.timestamp + offer.timelock, после истечения которого можно вернуть деньги покупателю
@@ -103,7 +103,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         uint64 expiresAt,
         bytes32 contentHash,
         string ipfsCid,
-        uint256 quantity
+        uint256 offerQuantity
     );
     event OfferCancelled(uint256 indexed offerId);
 
@@ -115,7 +115,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         uint256 amount,
         uint256 fee,
         uint64 autoRefundAt,
-        uint256 quantity
+        uint256 purchaseQuantity
     );
     event ReceiptConfirmed(uint256 indexed purchaseId, address indexed buyer); //возможно переименовать
 	event SellerCancelled(uint256 indexed purchaseId, uint256 refund); // было (purchaseId, penalty, refund) Что это?
@@ -277,7 +277,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
     /// @param expiresAt unix-время истечения оффера; 0 — бессрочный оффер
     /// @param contentHash keccak256-хэш контента/описания для доказательства авторства оффера
     /// @param ipfsCid CID в IPFS с метаданными/файлами товара
-    /// @param quantity объём лота; 0 — бесконечный запас, иначе лимит единиц на продажу
+    /// @param offerQuantity объём лота; 0 — бесконечный запас, иначе лимит единиц на продажу
     /// @return offerId идентификатор созданного оффера (инкремент nextOfferId)
     function createOffer(
         address token,
@@ -286,9 +286,9 @@ contract Marketplace is Ownable, ReentrancyGuard {
         uint64 expiresAt,
         bytes32 contentHash,
         string calldata ipfsCid,
-        uint256 quantity
+        uint256 offerQuantity
     ) external returns (uint256 offerId) {
-        return _createOffer(msg.sender, token, amount, timelock, expiresAt, contentHash, ipfsCid, quantity);
+        return _createOffer(msg.sender, token, amount, timelock, expiresAt, contentHash, ipfsCid, offerQuantity);
     }
 
     /// @notice Создаёт оффер через офчейн-подпись продавца (мета-транзакция/релеер)
@@ -300,8 +300,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
     /// @param expiresAt unix-время истечения оффера; 0 — бессрочно
     /// @param contentHash хэш контента для привязки оффера к автору
     /// @param ipfsCid CID в IPFS с описанием товара
-    /// @param quantity объём лота; 0 — бесконечно
-    /// @param signature EIP-712 подпись seller'а над OFFER_TYPEHASH (seller, token, amount, timelock, expiresAt, contentHash, keccak256(ipfsCid), quantity, nonce)
+    /// @param offerQuantity объём лота; 0 — бесконечно
+    /// @param signature EIP-712 подпись seller'а над OFFER_TYPEHASH (seller, token, amount, timelock, expiresAt, contentHash, keccak256(ipfsCid), offerQuantity, nonce)
     /// @return offerId идентификатор созданного оффера
     function createOfferWithSig(
         address seller,
@@ -311,7 +311,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         uint64 expiresAt,
         bytes32 contentHash,
         string calldata ipfsCid,
-        uint256 quantity,
+        uint256 offerQuantity,
         bytes calldata signature
     ) external returns (uint256 offerId) {
         uint256 nonce = nonces[seller]++;
@@ -325,12 +325,12 @@ contract Marketplace is Ownable, ReentrancyGuard {
                 expiresAt,
                 contentHash,
                 keccak256(bytes(ipfsCid)),
-                quantity,
+                offerQuantity,
                 nonce
             )
         );
         if (_recover(structHash, signature) != seller) revert InvalidSignature();
-        return _createOffer(seller, token, amount, timelock, expiresAt, contentHash, ipfsCid, quantity);
+        return _createOffer(seller, token, amount, timelock, expiresAt, contentHash, ipfsCid, offerQuantity);
     }
 
     /// @notice Отменяет активный оффер продавца, останавливая дальнейшие продажи
@@ -353,7 +353,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
     /// @param expiresAt unix-время истечения; 0 — бессрочно, иначе должно быть > block.timestamp
     /// @param contentHash хэш контента/описания
     /// @param ipfsCid CID в IPFS
-    /// @param quantity объём лота; 0 — бесконечный
+    /// @param offerQuantity объём лота; 0 — бесконечный
     /// @return offerId идентификатор созданного оффера
     function _createOffer(
         address seller,
@@ -363,7 +363,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         uint64 expiresAt,
         bytes32 contentHash,
         string calldata ipfsCid,
-        uint256 quantity
+        uint256 offerQuantity
     ) internal returns (uint256 offerId) {
         if (!allowedTokens[token]) revert TokenNotAllowed();
         if (amount == 0) revert InvalidAmount();
@@ -380,11 +380,11 @@ contract Marketplace is Ownable, ReentrancyGuard {
             contentHash: contentHash,
             ipfsCid: ipfsCid,
             active: true,
-            quantity: quantity,
+            offerQuantity: offerQuantity,
             sold: 0
         });
 
-        emit OfferCreated(offerId, seller, token, amount, timelock, expiresAt, contentHash, ipfsCid, quantity);
+        emit OfferCreated(offerId, seller, token, amount, timelock, expiresAt, contentHash, ipfsCid, offerQuantity);
     }
 
     // -------------------------------------------------------------------------
@@ -392,21 +392,21 @@ contract Marketplace is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice Покупает указанное количество единиц по офферу, блокируя средства в эскроу
-    /// @dev Проверяет активность и срок оффера, лимит quantity, инкрементирует sold, рассчитывает fee/sellerPayout/autoRefundAt, делает safeTransferFrom покупателя на контракт. Защищена от реентрантности
+    /// @dev Проверяет активность и срок оффера, лимит purchaseQuantity, инкрементирует sold, рассчитывает fee/sellerPayout/autoRefundAt, делает safeTransferFrom покупателя на контракт. Защищена от реентрантности
     /// @param offerId идентификатор покупаемого оффера
-    /// @param quantity количество единиц к покупке, должно быть >0 и не превышать остаток (если quantity оффера !=0)
+    /// @param purchaseQuantity количество единиц к покупке, должно быть >0 и не превышать остаток (если offerQuantity оффера !=0)
     /// @return purchaseId идентификатор созданной сделки эскроу
-    function purchase(uint256 offerId, uint256 quantity) external nonReentrant returns (uint256 purchaseId) {
-        if (quantity == 0) revert InvalidQuantity();
+    function purchase(uint256 offerId, uint256 purchaseQuantity) external nonReentrant returns (uint256 purchaseId) {
+        if (purchaseQuantity == 0) revert InvalidQuantity();
 
         Offer storage offer = offers[offerId];
         if (!offer.active) revert OfferInactive();
         if (offer.expiresAt != 0 && block.timestamp > offer.expiresAt) revert OfferExpired();
-        if (offer.quantity != 0 && offer.sold + quantity > offer.quantity) revert InsufficientQuantity();
+        if (offer.offerQuantity != 0 && offer.sold + purchaseQuantity > offer.offerQuantity) revert InsufficientQuantity();
 
-        offer.sold += quantity;
+        offer.sold += purchaseQuantity;
 
-        uint256 total = offer.amount * quantity;
+        uint256 total = offer.amount * purchaseQuantity;
         uint256 fee = (total * feeBps) / 10_000;
         uint256 sellerPayout = total - fee;
         uint64 autoRefundAt = uint64(block.timestamp + offer.timelock);
@@ -417,7 +417,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
             buyer: msg.sender,
             seller: offer.seller,
             token: offer.token,
-            quantity: quantity,
+            purchaseQuantity: purchaseQuantity,
             amount: total,
             fee: fee,
             sellerPayout: sellerPayout,
@@ -430,7 +430,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
         });
 
         IERC20(offer.token).safeTransferFrom(msg.sender, address(this), total);
-        emit PurchaseCreated(purchaseId, offerId, msg.sender, offer.seller, total, fee, autoRefundAt, quantity);
+        emit PurchaseCreated(purchaseId, offerId, msg.sender, offer.seller, total, fee, autoRefundAt, purchaseQuantity);
     }
 
     /// @notice Подтверждает получение товара покупателем и выплачивает средства продавцу
