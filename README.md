@@ -1,6 +1,6 @@
 To do:
-
-- Добавить возможность возврата части суммы в споре
+- Добавить регистрацию модератором через стейкинг, слешинг стейка
+- Сколько и как слешится за неправильные решения
 
 # dApp Marketplace — смарт-контракты (MVP)
 
@@ -30,9 +30,9 @@ Foundry-проект ядра эскроу по роудмапу и сценар
 3. `confirmReceipt` / `confirmReceiptWithSig` — выплата продавцу (`amount - fee`) и комиссии на `feeRecipient`.
 4. `sellerCancel` — возврат покупателю.
 5. `refundExpired` (keeper) — если нет подтверждения и нет спора, **возврат покупателю**.
-6. `openDispute` (любая сторона) — `disputeLock`, выплаты заморожены. Продавец так блокирует автовозврат, если товар выдан, а покупатель молчит.
-7. Модераторы (до 5 адресов) голосуют `vote`; простое большинство вызывает `set_receiver`.
-8. `executeVerdict` после `verdictDelay` (в спецификации — повторный timelock; апелляций на MVP нет).
+6. `openDispute` (покупатель или продавец) — `disputeLock`, выплаты заморожены. Продавец так блокирует автовозврат, если товар выдан, а покупатель молчит.
+7. Модераторы (до 5 адресов) голосуют `vote(purchaseId, refundBps)`; **refundBps в базисных пунктах 0–10000** (0 = 100% продавцу, 10000 = 100% покупателю, 5000 = 50/50). При достижении простого большинства считается **медиана** голосов и фиксируется как `verdictRefundBps`.
+8. `executeVerdict` после `verdictDelay` — **распределяет средства по verdictRefundBps**, комиссия протокола удерживается **только из доли продавца**. Апелляций на MVP нет.
 
 ## Бан пользователей (информационный, per-interface)
 
@@ -73,7 +73,7 @@ EIP-712: оффер и подтверждение получения можно 
 
 ## События для индексатора
 
-**Marketplace**: `OfferCreated`, `OfferCancelled`, `PurchaseCreated`, `ReceiptConfirmed`, `SellerCancelled`, `RefundedToBuyer`, `DisputeOpened`, `DisputeVote`, `ReceiverSet`, `Settled`.
+**Marketplace**: `OfferCreated`, `OfferCancelled`, `PurchaseCreated`, `ReceiptConfirmed`, `SellerCancelled`, `RefundedToBuyer`, `DisputeOpened`, `DisputeVote(uint256,address,uint16 refundBps)`, `VerdictRefundBpsSet(uint256,uint16 refundBps,uint64 verdictDelayUntil)`, `Settled`.
 
 **CuratorBanRegistry**: `BanStatusChanged`, `DelegateUpdated`, `GuardianUpdated`, `PausedByGuardian`, `UnpausedByCurator`.
 
@@ -107,8 +107,8 @@ forge script script/Deploy.s.sol --rpc-url $RPC --broadcast
 - Комиссия 0–10000 bps, то есть от 0 до 100%. Общая для всех офферов.
 - `cancelFeeBps` по умолчанию в деплое 1% — в заметках «комиссия сети» не задана числом; меняйте `setCancelFeeBps`. //cancelFeeBps deleted Поменять deploy.
 - `verdictDelay` по умолчанию 0, чтобы keeper сразу вызвал `executeVerdict`; для прод-зазора поставьте секунды.
+- **Спор: модераторы голосуют `refundBps` (0–10000), считается медиана при большинстве. Комиссия протокола удерживается только из доли продавца.**
 - Один раунд голосования, без стейка и апелляций.
 - Защита от компрометации ключа куратора — guardian-пауза (мгновенная заморозка `setBan`) и/или мультисиг в роли куратора; не задержка.
 - Бан — permissionless и per-curator (namespace = `msg.sender`), без влияния на ончейн-логику Marketplace.
-- Глобальный кросс-интерфейсный бан не реализован и не будет. Каждый интерфейс решает сам кого банить а кого нет.
-- 
+- Глобальный кросс-интерфейсный бан не реализован и не будет. Каждый интерфейс решает сам кого банить а кого нет. 

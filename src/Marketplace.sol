@@ -30,14 +30,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
         Escrowed,
         Disputed,
         Settled
-        // есть несколько стадий escrow
-        // возможно добавить статус до подтверждения покупателем
-    }
-
-    enum Receiver {
-        None,
-        Seller,
-        Buyer
     }
 
     struct Offer {
@@ -55,18 +47,19 @@ contract Marketplace is Ownable, ReentrancyGuard {
 
     struct Purchase {
         uint256 offerId;
-        address buyer; //нельзя менять на msg.sender потому что может быть релеер
-        address seller; //достать из Offer? Как и 4 строки ниже
+        address buyer;
+        address seller;
         address token; 
-        uint256 purchaseQuantity; // сколько единиц куплено в этой сделке (batch)
-        uint256 amount; // сумма эскроу = offer.amount (цена за единицу) * purchaseQuantity
+        uint256 purchaseQuantity;
+        uint256 amount;
         uint256 fee;
         uint256 sellerPayout;
-        uint64 autoRefundAt; //Это момент block.timestamp + offer.timelock, после истечения которого можно вернуть деньги покупателю
-        uint64 verdictDelayUntil; // Задержка перед выплатой после вынесения вердикта. Будет использоваться только если нужна апелляция
+        uint64 autoRefundAt;
+        uint64 verdictDelayUntil;
         PurchaseState state;
-        Receiver pendingReceiver;
-        bytes32 evidenceHash; //Хэш пакета доказательств (чат + файлы), который сторона предоставляет при открытии спора
+        uint16 verdictRefundBps; // 0 = full to seller, 10000 = full to buyer, 5000 = 50/50 split
+        bool verdictSet; // true когда вердикт зафиксирован (медиана рассчитана)
+        bytes32 evidenceHash;
         bool disputeLock;
     }
 
@@ -84,8 +77,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
     address[] public moderators;
     mapping(address => bool) public isModerator;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
-    mapping(uint256 => uint256) public votesForSeller; //работает для каждой сделки отдельно
-    mapping(uint256 => uint256) public votesForBuyer;
+    mapping(uint256 => uint16[]) public moderatorVotes; // хранит refundBps каждого модератора для расчёта медианы
 
     event TokenAllowed(address indexed token, bool allowed);
     event FeeRecipientUpdated(address indexed feeRecipient);
@@ -121,8 +113,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
 	event SellerCancelled(uint256 indexed purchaseId, uint256 refund); // было (purchaseId, penalty, refund) Что это?
     event RefundedToBuyer(uint256 indexed purchaseId, uint256 amount);
     event DisputeOpened(uint256 indexed purchaseId, address indexed opener, bytes32 evidenceHash);
-    event DisputeVote(uint256 indexed purchaseId, address indexed moderator, Receiver choice);
-    event ReceiverSet(uint256 indexed purchaseId, Receiver receiver, uint64 verdictDelayUntil); //переименовать
+    event DisputeVote(uint256 indexed purchaseId, address indexed moderator, uint16 refundBps);
+    event VerdictRefundBpsSet(uint256 indexed purchaseId, uint16 refundBps, uint64 verdictDelayUntil);
     event Settled(uint256 indexed purchaseId, address indexed receiver, uint256 amount, uint256 fee); //переименовать
 
     error InvalidFee();
@@ -424,7 +416,6 @@ contract Marketplace is Ownable, ReentrancyGuard {
             autoRefundAt: autoRefundAt,
             verdictDelayUntil: 0,
             state: PurchaseState.Escrowed,
-            pendingReceiver: Receiver.None,
             evidenceHash: bytes32(0),
             disputeLock: false
         });
@@ -452,8 +443,8 @@ contract Marketplace is Ownable, ReentrancyGuard {
         _confirm(purchaseId, buyer);
     }
 
-    /// @notice Внутренняя логика подтверждения получения: валидирует право покупателя и переводит средства
-    /// @dev Проверяет state==Escrowed, !disputeLock, p.buyer==buyer. Эмитит ReceiptConfirmed и делегирует выплату в _paySeller
+    /// @notice Внутренняя логика подтверждения получения: валидирует право покупателя и выплачивает продавцу (обычный фロー без спора)
+    /// @dev Проверяет state==Escrowed, !disputeLock, p.buyer==buyer. Эмитит ReceiptConfirmed и вызывает _paySeller для полной выплаты продавцу минус комиссия
     /// @param purchaseId идентификатор сделки
     /// @param buyer адрес покупателя, который подтверждает получение
     function _confirm(uint256 purchaseId, address buyer) internal {
@@ -516,63 +507,104 @@ contract Marketplace is Ownable, ReentrancyGuard {
         emit DisputeOpened(purchaseId, msg.sender, evidenceHash);
     }
 
-    /// @notice Фиксирует голос модератора в споре; при достижении большинства автоматически выставляет pendingReceiver
-    /// @dev Требует isModerator[msg.sender], state==Disputed, не голосовал ранее. Инкрементирует votesForSeller/Buyer и вызывает _setReceiver при majorityThreshold
+    /// @notice Фиксирует голос модератора в споре; при достижении большинства рассчитывает медиану и фиксирует verdictRefundBps
+    /// @dev Требует isModerator[msg.sender], state==Disputed, не голосовал ранее. refundBps в базисных пунктах (0=100% продавцу, 10000=100% покупателю). Сохраняет голос в moderatorVotes, при majorityThreshold вычисляет медиану и вызывает _setReceiver
     /// @param purchaseId идентификатор оспариваемой сделки
-    /// @param forSeller true — голос за продавца, false — за покупателя
-    function vote(uint256 purchaseId, bool forSeller) external {
+    /// @param refundBps процент возврата покупателю в базисных пунктах (0-10000)
+    function vote(uint256 purchaseId, uint16 refundBps) external {
         if (!isModerator[msg.sender]) revert NotModerator();
+        if (refundBps > MAX_BPS) revert InvalidFee();
         Purchase storage p = purchases[purchaseId];
         if (p.state != PurchaseState.Disputed || !p.disputeLock) revert BadState();
         if (hasVoted[purchaseId][msg.sender]) revert AlreadyVoted();
 
         hasVoted[purchaseId][msg.sender] = true;
-        Receiver choice = forSeller ? Receiver.Seller : Receiver.Buyer;
-        if (forSeller) votesForSeller[purchaseId] += 1;
-        else votesForBuyer[purchaseId] += 1;
+        moderatorVotes[purchaseId].push(refundBps);
 
-        emit DisputeVote(purchaseId, msg.sender, choice);
+        emit DisputeVote(purchaseId, msg.sender, refundBps);
 
         uint256 need = majorityThreshold();
-        if (votesForSeller[purchaseId] >= need) {
-            _setReceiver(purchaseId, p, Receiver.Seller);
-        } else if (votesForBuyer[purchaseId] >= need) {
-            _setReceiver(purchaseId, p, Receiver.Buyer);
+        if (moderatorVotes[purchaseId].length >= need) {
+            uint16 medianBps = _calculateMedian(moderatorVotes[purchaseId]);
+            _setReceiver(purchaseId, p, medianBps);
         }
     }
 
-    /// @notice Внутренняя фиксация победителя спора и запуск задержки перед выплатой
-    /// @dev Ставит pendingReceiver, снимает disputeLock, выставляет verdictDelayUntil = block.timestamp + verdictDelay
-    /// @param purchaseId идентификатор сделки
-    /// @param p storage-указатель на структуру Purchase
-    /// @param receiver выбранный получатель средств (Seller или Buyer)
-    function _setReceiver(uint256 purchaseId, Purchase storage p, Receiver receiver) internal {
-        p.pendingReceiver = receiver;
-        p.disputeLock = false;
-        p.verdictDelayUntil = uint64(block.timestamp + verdictDelay);
-        emit ReceiverSet(purchaseId, receiver, p.verdictDelayUntil);
+    /// @notice Вычисляет медиану массива голосов в базисных пунктах
+    /// @dev Сортирует копию массива и возвращает среднее значение (для чётного количества — среднее двух центральных). Pure function, не читает storage.
+    /// @param votes массив голосов модераторов (refundBps)
+    /// @return медиана в базисных пунктах
+    function _calculateMedian(uint16[] memory votes) internal pure returns (uint16) {
+        uint256 n = votes.length;
+        if (n == 0) return 0;
+        
+        uint16[] memory sorted = new uint16[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            sorted[i] = votes[i];
+        }
+        
+        for (uint256 i = 0; i < n - 1; ++i) {
+            for (uint256 j = 0; j < n - i - 1; ++j) {
+                if (sorted[j] > sorted[j + 1]) {
+                    (sorted[j], sorted[j + 1]) = (sorted[j + 1], sorted[j]);
+                }
+            }
+        }
+        
+        if (n % 2 == 1) {
+            return sorted[n / 2];
+        } else {
+            return uint16((sorted[n / 2 - 1] + sorted[n / 2]) / 2);
+        }
     }
 
-    /// @notice Исполняет вердикт модераторов после истечения verdictDelay, выплачивая средства победителю
-    /// @dev Требует state==Disputed, pendingReceiver!=None, block.timestamp >= verdictDelayUntil. При Seller вызывает _paySeller, при Buyer переводит всю сумму покупателю. Защищена от реентрантности
+    /// @notice Внутренняя фиксация вердикта спора (медианный refundBps) и запуск задержки перед выплатой
+    /// @dev Записывает verdictRefundBps, verdictSet=true, снимает disputeLock, выставляет verdictDelayUntil = block.timestamp + verdictDelay
+    /// @param purchaseId идентификатор сделки
+    /// @param p storage-указатель на структуру Purchase
+    /// @param refundBps медианный процент возврата покупателю в базисных пунктах (0-10000)
+    function _setReceiver(uint256 purchaseId, Purchase storage p, uint16 refundBps) internal {
+        p.verdictRefundBps = refundBps;
+        p.verdictSet = true;
+        p.disputeLock = false;
+        p.verdictDelayUntil = uint64(block.timestamp + verdictDelay);
+        emit VerdictRefundBpsSet(purchaseId, refundBps, p.verdictDelayUntil);
+    }
+
+    /// @notice Исполняет вердикт модераторов после истечения verdictDelay, распределяя средства по verdictRefundBps // Может быть задержана и отменена апелляцией?
+    /// @dev Требует state==Disputed, verdictSet==true, block.timestamp >= verdictDelayUntil.
+    /// Комиссия протокола удерживается только из доли продавца. Защищена от реентрантности.
     /// @param purchaseId идентификатор сделки с вынесенным вердиктом
     function executeVerdict(uint256 purchaseId) external nonReentrant {
         Purchase storage p = purchases[purchaseId];
         if (p.state != PurchaseState.Disputed) revert BadState();
-        if (p.pendingReceiver == Receiver.None) revert NoPendingReceiver();
+        if (!p.verdictSet) revert NoPendingReceiver();
         if (block.timestamp < p.verdictDelayUntil) revert VerdictDelayNotReached();
 
-        if (p.pendingReceiver == Receiver.Seller) {
-            _paySeller(p, purchaseId);
-        } else {
-            p.state = PurchaseState.Settled;
-            IERC20(p.token).safeTransfer(p.buyer, p.amount);
-            emit Settled(purchaseId, p.buyer, p.amount, 0);
+        uint256 buyerShare = (p.amount * p.verdictRefundBps) / MAX_BPS;
+        uint256 sellerShare = p.amount - buyerShare;
+        uint256 fee = (sellerShare * feeBps) / MAX_BPS;
+        uint256 sellerPayout = sellerShare - fee;
+
+        p.state = PurchaseState.Settled;
+        IERC20 token = IERC20(p.token);
+
+        if (buyerShare > 0) {
+            token.safeTransfer(p.buyer, buyerShare);
         }
+        if (fee > 0) {
+            token.safeTransfer(feeRecipient, fee);
+        }
+        if (sellerPayout > 0) {
+            token.safeTransfer(p.seller, sellerPayout);
+        }
+
+        emit Settled(purchaseId, p.buyer, buyerShare, fee);
+        emit Settled(purchaseId, p.seller, sellerPayout, fee);
     }
 
-    /// @notice Внутренняя выплата продавцу с удержанием комиссии протокола
-    /// @dev Ставит state=Settled, переводит fee на feeRecipient и sellerPayout на seller, эмитит Settled
+    /// @notice Внутренняя выплата продавцу с удержанием комиссии протокола (обычный фロー: покупатель подтвердил получение без спора)
+    /// @dev Ставит state=Settled, переводит fee на feeRecipient и sellerPayout на seller, эмитит Settled. Используется в _confirm и sellerCancel.
     /// @param p storage-указатель на структуру Purchase с заполненными fee/sellerPayout/token
     /// @param purchaseId идентификатор сделки для события Settled
     function _paySeller(Purchase storage p, uint256 purchaseId) internal {
